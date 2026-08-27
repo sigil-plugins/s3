@@ -1,4 +1,5 @@
 /build/
 /dist/
 /plugin.wasm
+/target/
 __pycache__/

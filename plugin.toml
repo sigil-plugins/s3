@@ -1,19 +1,19 @@
 schema_version = 1
-name = "example"
+name = "s3"
 version = "0.1.0"
-description = "pure Sigil plugin template"
+description = "bounded anonymous and presigned S3-compatible object reader for Sigil"
 license = "MIT"
 
 [component]
 file = "plugin.wasm"
-entrypoint = "example:plugin/api@1.0.0"
+entrypoint = "sigil:s3/client@0.1.0"
 
 [requires]
 sigil = ">=0.31.0, <1.0.0"
 host_api = "^1.0"
 
 [capabilities]
+network = true
 
 [repository]
-source = "github:owner/example"
-
+source = "github:sigil-plugins/s3"
