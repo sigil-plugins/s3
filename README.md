@@ -39,7 +39,15 @@ percent-expanded key, endpoint, and HTTP framing). Reads follow `Content-Length`
 or chunked framing so a small final body fragment does not reserve another large
 block of quota.
 
-Build, validate against the pinned SDK host WIT, and pack a local candidate:
+Install the official immutable release and add it to the current project:
+
+```bash
+sigil plugin install s3@0.1.0
+sigil plugin add s3@0.1.0
+```
+
+Build, validate against the pinned SDK host WIT, and pack a local development
+archive:
 
 ```bash
 just check
@@ -49,6 +57,6 @@ just dist
 `SDK_CHECKOUT=/path/to/sigil-plugin-sdk just check` verifies against a local
 SDK checkout; otherwise the exact commit in `SDK.lock` is fetched and compared.
 
-This repository is a local candidate until its source, exact component/package
-bytes, release policy, and official namespace publication receive the separate
-human gate required by Sigil's immutable plugin process.
+Official versions are published once from independently reviewed candidate
+artifacts by the repository's keyless GitHub OIDC workflow. Public tags and
+release assets are immutable; a conflicting release burns that SemVer.
