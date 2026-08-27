@@ -93,7 +93,12 @@ fn get_object(options: &GetOptions) -> Result<Vec<u8>, Error> {
                     message: "S3 response exceeds the wire byte limit".to_owned(),
                 });
             }
-            let requested = u32::try_from(remaining)
+            let Some(useful) =
+                http::next_read_size(&response, max_bytes).map_err(|error| client_error(&error))?
+            else {
+                break;
+            };
+            let requested = u32::try_from(remaining.min(useful))
                 .unwrap_or(u32::MAX)
                 .min(HOST_READ_BYTES);
             let chunk = stream.read(requested).map_err(net_error)?;

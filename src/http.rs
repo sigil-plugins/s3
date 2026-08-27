@@ -217,6 +217,11 @@ struct ResponseHeaders {
     chunked: bool,
 }
 
+enum ChunkedProgress {
+    Complete,
+    Need(usize),
+}
+
 #[inline(never)]
 fn parse_headers(raw: &[u8], end: usize) -> Result<ResponseHeaders, HttpError> {
     let text = std::str::from_utf8(&raw[..end - 2]).map_err(|_error| {
@@ -349,6 +354,146 @@ fn find_crlf(raw: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+fn chunked_progress(body: &[u8], max_bytes: usize) -> Result<ChunkedProgress, HttpError> {
+    let mut cursor = 0_usize;
+    let mut decoded_bytes = 0_usize;
+    let mut chunks = 0_usize;
+    loop {
+        chunks = chunks
+            .checked_add(1)
+            .ok_or_else(|| HttpError::new(HttpErrorKind::Limit, "S3 chunk count overflowed"))?;
+        if chunks > MAX_CHUNKS {
+            return Err(HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 response contains too many HTTP chunks",
+            ));
+        }
+        let Some(line_end) = find_crlf(body, cursor) else {
+            let available = body.len().saturating_sub(cursor);
+            if available >= 10 {
+                return Err(HttpError::new(
+                    HttpErrorKind::Protocol,
+                    "S3 response has an invalid HTTP chunk size",
+                ));
+            }
+            return Ok(ChunkedProgress::Need(10 - available));
+        };
+        let size_bytes = &body[cursor..line_end];
+        if size_bytes.is_empty()
+            || size_bytes.len() > 8
+            || !size_bytes.iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 response has an invalid HTTP chunk size",
+            ));
+        }
+        let size_text = std::str::from_utf8(size_bytes).map_err(|_error| {
+            HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 response has an invalid HTTP chunk size",
+            )
+        })?;
+        let size = usize::from_str_radix(size_text, 16).map_err(|_error| {
+            HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 response has an invalid HTTP chunk size",
+            )
+        })?;
+        cursor = line_end + 2;
+        if size == 0 {
+            let available = body.len().saturating_sub(cursor);
+            return if available < 2 {
+                Ok(ChunkedProgress::Need(2 - available))
+            } else {
+                Ok(ChunkedProgress::Complete)
+            };
+        }
+        decoded_bytes = decoded_bytes.checked_add(size).ok_or_else(|| {
+            HttpError::new(HttpErrorKind::Limit, "S3 object byte count overflowed")
+        })?;
+        if decoded_bytes > max_bytes {
+            return Err(HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 object exceeds the requested byte limit",
+            ));
+        }
+        let data_end = cursor
+            .checked_add(size)
+            .ok_or_else(|| HttpError::new(HttpErrorKind::Limit, "S3 chunk offset overflowed"))?;
+        let framed_end = data_end
+            .checked_add(2)
+            .ok_or_else(|| HttpError::new(HttpErrorKind::Limit, "S3 chunk offset overflowed"))?;
+        if body.len() < framed_end {
+            return Ok(ChunkedProgress::Need(framed_end - body.len()));
+        }
+        if body.get(data_end..framed_end) != Some(b"\r\n") {
+            return Err(HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 response has malformed HTTP chunk framing",
+            ));
+        }
+        cursor = framed_end;
+    }
+}
+
+/// Return the largest useful next host read for the response received so far.
+///
+/// Framed responses request only bytes that their HTTP framing proves remain.
+/// This matters because Sigil reserves the requested amount against the named
+/// endpoint quota before performing I/O.
+pub fn next_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, HttpError> {
+    let Some(offset) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        if raw.len() >= MAX_HEADER_BYTES {
+            return Err(HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 response header exceeds the byte limit",
+            ));
+        }
+        return Ok(Some(MAX_HEADER_BYTES - raw.len()));
+    };
+    let end = offset + 4;
+    if end > MAX_HEADER_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 response header exceeds the byte limit",
+        ));
+    }
+    let headers = parse_headers(raw, end)?;
+    if let Some(error) = status_error(headers.status) {
+        return Err(error);
+    }
+    if headers
+        .content_length
+        .is_some_and(|length| length > max_bytes)
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 object exceeds the requested byte limit",
+        ));
+    }
+    if headers.chunked {
+        return match chunked_progress(&raw[end..], max_bytes)? {
+            ChunkedProgress::Complete => Ok(None),
+            ChunkedProgress::Need(bytes) => Ok(Some(bytes)),
+        };
+    }
+    if let Some(content_length) = headers.content_length {
+        let expected = end.checked_add(content_length).ok_or_else(|| {
+            HttpError::new(HttpErrorKind::Limit, "S3 response byte count overflowed")
+        })?;
+        return Ok((raw.len() < expected).then_some(expected - raw.len()));
+    }
+    let body_bytes = raw.len() - end;
+    if body_bytes > max_bytes {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 object exceeds the requested byte limit",
+        ));
+    }
+    Ok(Some(max_bytes - body_bytes + 1))
+}
+
 #[inline(never)]
 fn decode_chunked(body: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
     let mut cursor = 0_usize;
@@ -420,14 +565,17 @@ fn decode_chunked(body: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
                 "S3 response has a truncated HTTP chunk",
             )
         })?;
-        if body.get(data_end..data_end + 2) != Some(b"\r\n") {
+        let framed_end = data_end
+            .checked_add(2)
+            .ok_or_else(|| HttpError::new(HttpErrorKind::Limit, "S3 chunk offset overflowed"))?;
+        if body.get(data_end..framed_end) != Some(b"\r\n") {
             return Err(HttpError::new(
                 HttpErrorKind::Protocol,
                 "S3 response has malformed HTTP chunk framing",
             ));
         }
         output.extend_from_slice(data);
-        cursor = data_end + 2;
+        cursor = framed_end;
     }
 }
 
@@ -558,5 +706,48 @@ mod tests {
         ] {
             assert!(decode_response(raw, 1024).is_err());
         }
+    }
+
+    #[test]
+    fn read_sizes_follow_framing_without_reserving_a_full_chunk_for_the_tail() {
+        assert_eq!(
+            next_read_size(b"", 4).expect("empty response"),
+            Some(32_768)
+        );
+
+        let fixed_header = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(
+            next_read_size(fixed_header, 4).expect("fixed header"),
+            Some(4)
+        );
+        let mut fixed_partial = fixed_header.to_vec();
+        fixed_partial.extend_from_slice(b"ABC");
+        assert_eq!(
+            next_read_size(&fixed_partial, 4).expect("fixed tail"),
+            Some(1)
+        );
+        fixed_partial.push(b'D');
+        assert_eq!(
+            next_read_size(&fixed_partial, 4).expect("fixed complete"),
+            None
+        );
+
+        let chunked_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut chunked_partial = chunked_header.to_vec();
+        chunked_partial.extend_from_slice(b"4\r\nABC");
+        assert_eq!(
+            next_read_size(&chunked_partial, 4).expect("chunked tail"),
+            Some(3)
+        );
+        chunked_partial.extend_from_slice(b"D\r\n0\r\n\r\n");
+        assert_eq!(
+            next_read_size(&chunked_partial, 4).expect("chunked complete"),
+            None
+        );
+
+        let eof_header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mut eof_full = eof_header.to_vec();
+        eof_full.extend_from_slice(b"ABCD");
+        assert_eq!(next_read_size(&eof_full, 4).expect("EOF probe"), Some(1));
     }
 }
