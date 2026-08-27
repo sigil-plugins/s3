@@ -18,8 +18,6 @@ check: sdk-drift
     cargo test --locked
     cargo clippy --all-targets --locked -- -D warnings
     just build
-    {{sigil}} plugin validate plugin.toml
-    {{sigil}} plugin inspect plugin.toml --format json
 
 sigil-check: check
     {{sigil}} plugin validate plugin.toml
