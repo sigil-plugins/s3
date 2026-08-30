@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 pub const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_HEADER_BYTES: usize = 32 * 1024;
 pub const MAX_WIRE_OVERHEAD_BYTES: usize = 64 * 1024;
+const MAX_S3_ERROR_BODY_BYTES: usize = 32 * 1024;
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_CHUNKS: usize = 4_096;
 
@@ -13,6 +14,7 @@ pub enum HttpErrorKind {
     Denied,
     NotFound,
     Server,
+    ClockSkew,
     Limit,
     Unsupported,
 }
@@ -81,6 +83,55 @@ fn push_encoded_key(output: &mut String, key: &str) {
     }
 }
 
+/// Build the exact path-style S3 canonical URI supplied to the host signer.
+///
+/// The host validates but does not normalize these bytes. Object-key slashes
+/// remain path separators; every other non-unreserved byte uses uppercase
+/// RFC 3986 percent encoding.
+pub fn build_canonical_uri(bucket: &str, key: &str, max_bytes: usize) -> Result<String, HttpError> {
+    if !valid_bucket(bucket) || key.is_empty() || key.len() > 1_024 {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "invalid S3 bucket or key",
+        ));
+    }
+    if max_bytes == 0 || max_bytes > MAX_OBJECT_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "requested object byte limit is outside the supported range",
+        ));
+    }
+
+    let mut uri = String::with_capacity(bucket.len() + key.len() * 3 + 2);
+    uri.push('/');
+    uri.push_str(bucket);
+    uri.push('/');
+    push_encoded_key(&mut uri, key);
+    Ok(uri)
+}
+
+/// Build the deliberately narrower canonical URI accepted by `SigV4` grants.
+///
+/// The host rejects encoded percent signs and backslashes as well as dot
+/// segments. Reject them here too, before requesting signing authority. The
+/// legacy anonymous and presigned paths retain their broader object-key
+/// behavior through [`build_canonical_uri`].
+pub fn build_sigv4_canonical_uri(
+    bucket: &str,
+    key: &str,
+    max_bytes: usize,
+) -> Result<String, HttpError> {
+    if key.bytes().any(|byte| matches!(byte, b'%' | b'\\'))
+        || key.split('/').any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "object key is outside the supported SigV4 path shape",
+        ));
+    }
+    build_canonical_uri(bucket, key, max_bytes)
+}
+
 fn valid_presigned_query(query: &str) -> bool {
     !query.is_empty()
         && query.len() <= MAX_QUERY_BYTES
@@ -132,16 +183,10 @@ pub fn build_get_request(
     presigned_authority: Option<&str>,
     max_bytes: usize,
 ) -> Result<Vec<u8>, HttpError> {
-    if !valid_endpoint(endpoint) || !valid_bucket(bucket) || key.is_empty() || key.len() > 1_024 {
+    if !valid_endpoint(endpoint) {
         return Err(HttpError::new(
             HttpErrorKind::InvalidRequest,
             "invalid S3 endpoint, bucket, or key",
-        ));
-    }
-    if max_bytes == 0 || max_bytes > MAX_OBJECT_BYTES {
-        return Err(HttpError::new(
-            HttpErrorKind::Limit,
-            "requested object byte limit is outside the supported range",
         ));
     }
     if presigned_query.is_some_and(|query| !valid_presigned_query(query)) {
@@ -159,11 +204,7 @@ pub fn build_get_request(
         ));
     }
 
-    let mut target = String::with_capacity(bucket.len() + key.len() * 3 + MAX_QUERY_BYTES + 2);
-    target.push('/');
-    target.push_str(bucket);
-    target.push('/');
-    push_encoded_key(&mut target, key);
+    let mut target = build_canonical_uri(bucket, key, max_bytes)?;
     if let Some(query) = presigned_query {
         target.push('?');
         target.push_str(query);
@@ -486,6 +527,22 @@ fn chunked_progress(body: &[u8], max_bytes: usize) -> Result<ChunkedProgress, Ht
 /// This matters because Sigil reserves the requested amount against the named
 /// endpoint quota before performing I/O.
 pub fn next_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, HttpError> {
+    next_read_size_impl(raw, max_bytes, false)
+}
+
+/// Return the next bounded read for a host-signed response.
+///
+/// Unlike the legacy raw-network path, this reads a bounded, framed 4xx body
+/// so exact S3 clock-skew codes can be classified without exposing the body.
+pub fn next_signed_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, HttpError> {
+    next_read_size_impl(raw, max_bytes, true)
+}
+
+fn next_read_size_impl(
+    raw: &[u8],
+    max_bytes: usize,
+    read_s3_error: bool,
+) -> Result<Option<usize>, HttpError> {
     let Some(offset) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
         if raw.len() >= MAX_HEADER_BYTES {
             return Err(HttpError::new(
@@ -503,12 +560,10 @@ pub fn next_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, Htt
         ));
     }
     let headers = parse_headers(raw, end)?;
-    if let Some(error) = status_error(headers.status) {
-        return Err(error);
-    }
+    let body_limit = response_body_limit(headers.status, max_bytes, read_s3_error)?;
     if headers
         .content_length
-        .is_some_and(|length| length > max_bytes)
+        .is_some_and(|length| length > body_limit)
     {
         return Err(HttpError::new(
             HttpErrorKind::Limit,
@@ -516,7 +571,7 @@ pub fn next_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, Htt
         ));
     }
     if headers.chunked {
-        return match chunked_progress(&raw[end..], max_bytes)? {
+        return match chunked_progress(&raw[end..], body_limit)? {
             ChunkedProgress::Complete => Ok(None),
             ChunkedProgress::Need(bytes) => Ok(Some(bytes)),
         };
@@ -528,13 +583,32 @@ pub fn next_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usize>, Htt
         return Ok((raw.len() < expected).then_some(expected - raw.len()));
     }
     let body_bytes = raw.len() - end;
-    if body_bytes > max_bytes {
+    if body_bytes > body_limit {
         return Err(HttpError::new(
             HttpErrorKind::Limit,
             "S3 object exceeds the requested byte limit",
         ));
     }
-    Ok(Some(max_bytes - body_bytes + 1))
+    Ok(Some(body_limit - body_bytes + 1))
+}
+
+fn response_body_limit(
+    status: u16,
+    object_limit: usize,
+    read_s3_error: bool,
+) -> Result<usize, HttpError> {
+    if status == 200 {
+        return Ok(object_limit);
+    }
+    if read_s3_error && (400..=499).contains(&status) {
+        return Ok(MAX_S3_ERROR_BODY_BYTES);
+    }
+    Err(status_error(status).unwrap_or_else(|| {
+        HttpError::new(
+            HttpErrorKind::Protocol,
+            "S3 server returned an unexpected status",
+        )
+    }))
 }
 
 #[inline(never)]
@@ -624,14 +698,26 @@ fn decode_chunked(body: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
 
 #[inline(never)]
 pub fn decode_response(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
+    decode_response_impl(raw, max_bytes, false)
+}
+
+/// Decode a host-signed response and classify only exact structured S3
+/// clock-skew codes. The raw XML and all other upstream fields are discarded.
+pub fn decode_signed_response(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpError> {
+    decode_response_impl(raw, max_bytes, true)
+}
+
+fn decode_response_impl(
+    raw: &[u8],
+    max_bytes: usize,
+    read_s3_error: bool,
+) -> Result<Vec<u8>, HttpError> {
     let end = header_end(raw)?;
     let headers = parse_headers(raw, end)?;
-    if let Some(error) = status_error(headers.status) {
-        return Err(error);
-    }
+    let body_limit = response_body_limit(headers.status, max_bytes, read_s3_error)?;
     if headers
         .content_length
-        .is_some_and(|length| length > max_bytes)
+        .is_some_and(|length| length > body_limit)
     {
         return Err(HttpError::new(
             HttpErrorKind::Limit,
@@ -639,24 +725,62 @@ pub fn decode_response(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>, HttpErro
         ));
     }
     let body = &raw[end..];
-    if headers.chunked {
-        return decode_chunked(body, max_bytes);
+    let decoded = if headers.chunked {
+        decode_chunked(body, body_limit)?
+    } else {
+        if let Some(expected) = headers.content_length
+            && expected != body.len()
+        {
+            return Err(HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 response body does not match Content-Length",
+            ));
+        }
+        if body.len() > body_limit {
+            return Err(HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 object exceeds the requested byte limit",
+            ));
+        }
+        body.to_vec()
+    };
+
+    if headers.status == 200 {
+        return Ok(decoded);
     }
-    if let Some(expected) = headers.content_length
-        && expected != body.len()
+    let error = if read_s3_error && structured_s3_clock_skew_code(&decoded).is_some() {
+        HttpError::with_status(
+            HttpErrorKind::ClockSkew,
+            headers.status,
+            "S3 rejected the request signing time",
+        )
+    } else {
+        status_error(headers.status).unwrap_or_else(|| {
+            HttpError::new(
+                HttpErrorKind::Protocol,
+                "S3 server returned an unexpected status",
+            )
+        })
+    };
+    Err(error)
+}
+
+fn structured_s3_clock_skew_code(body: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(body).ok()?.trim_start();
+    let text = if let Some(after_open) = text.strip_prefix("<?xml") {
+        after_open.split_once("?>")?.1.trim_start()
+    } else {
+        text
+    };
+    let error = text.strip_prefix("<Error>")?.trim_start();
+    let code = error.strip_prefix("<Code>")?.split_once("</Code>")?.0;
+    if code.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && matches!(code, "RequestTimeTooSkewed" | "RequestExpired")
     {
-        return Err(HttpError::new(
-            HttpErrorKind::Protocol,
-            "S3 response body does not match Content-Length",
-        ));
+        Some(code)
+    } else {
+        None
     }
-    if body.len() > max_bytes {
-        return Err(HttpError::new(
-            HttpErrorKind::Limit,
-            "S3 object exceeds the requested byte limit",
-        ));
-    }
-    Ok(body.to_vec())
 }
 
 #[cfg(test)]
@@ -798,6 +922,99 @@ mod tests {
             assert_eq!(error.kind, kind);
             assert_eq!(error.status, Some(status));
             assert!(!error.message.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn signed_errors_classify_only_exact_structured_clock_skew_codes() {
+        for code in ["RequestTimeTooSkewed", "RequestExpired"] {
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>do not return me</Message><RequestId>sensitive</RequestId></Error>"
+            );
+            let raw = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let error = decode_signed_response(raw.as_bytes(), 1)
+                .expect_err("structured signing-time rejection must fail");
+            assert_eq!(error.kind, HttpErrorKind::ClockSkew);
+            assert_eq!(error.status, Some(403));
+            assert!(!error.message.contains(code));
+            assert!(!error.message.contains("sensitive"));
+        }
+
+        for body in [
+            "<Error><Code>SignatureDoesNotMatch</Code><Message>RequestExpired</Message></Error>",
+            "<Error><Message>RequestExpired</Message><Code>RequestExpired</Code></Error>",
+            "free text RequestTimeTooSkewed",
+        ] {
+            let raw = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let error = decode_signed_response(raw.as_bytes(), 1)
+                .expect_err("noncanonical error shape must fail");
+            assert_eq!(error.kind, HttpErrorKind::Denied);
+            assert_eq!(error.status, Some(403));
+        }
+    }
+
+    #[test]
+    fn signed_error_body_reads_are_framed_and_bounded() {
+        let body = "<Error><Code>RequestExpired</Code></Error>";
+        let header = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        assert_eq!(
+            next_read_size(header.as_bytes(), 1)
+                .expect_err("legacy path preserves immediate status mapping")
+                .kind,
+            HttpErrorKind::Protocol
+        );
+        assert_eq!(
+            next_signed_read_size(header.as_bytes(), 1).expect("signed error body is readable"),
+            Some(body.len())
+        );
+        let complete = format!("{header}{body}");
+        assert_eq!(
+            next_signed_read_size(complete.as_bytes(), 1).expect("signed body is complete"),
+            None
+        );
+
+        let oversized = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n",
+            MAX_S3_ERROR_BODY_BYTES + 1
+        );
+        assert_eq!(
+            next_signed_read_size(oversized.as_bytes(), 1)
+                .expect_err("oversized error body must fail before reading")
+                .kind,
+            HttpErrorKind::Limit
+        );
+    }
+
+    #[test]
+    fn signed_canonical_uri_matches_aws_encoding_rules_and_rejects_escapes() {
+        assert_eq!(
+            build_sigv4_canonical_uri("examplebucket", "photos/Jan/sample.jpg", 1)
+                .expect("AWS object-key example"),
+            "/examplebucket/photos/Jan/sample.jpg"
+        );
+        assert_eq!(
+            build_sigv4_canonical_uri("examplebucket", "snow man/é+.txt", 1)
+                .expect("UTF-8 and reserved bytes"),
+            "/examplebucket/snow%20man/%C3%A9%2B.txt"
+        );
+        for key in [".", "..", "x/../y", r"x\y", "x%2Fy"] {
+            assert!(
+                build_sigv4_canonical_uri("examplebucket", key, 1).is_err(),
+                "signed key {key:?} must be rejected"
+            );
+            assert!(
+                build_canonical_uri("examplebucket", key, 1).is_ok(),
+                "legacy raw key {key:?} must remain accepted"
+            );
         }
     }
 
