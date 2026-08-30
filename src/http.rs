@@ -91,7 +91,9 @@ fn valid_presigned_query(query: &str) -> bool {
 }
 
 fn valid_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok_and(|value| value != 0)
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|value| value != 0)
 }
 
 fn valid_presigned_authority(authority: &str) -> bool {
@@ -706,6 +708,8 @@ mod tests {
         for authority in [
             "",
             "example.com:0",
+            "example.com:+80",
+            "example.com:-1",
             "example.com:65536",
             "user@example.com",
             "example.com/path",
