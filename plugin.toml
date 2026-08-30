@@ -1,12 +1,12 @@
 schema_version = 1
 name = "s3"
-version = "0.1.0"
+version = "0.1.1"
 description = "bounded anonymous and presigned S3-compatible object reader for Sigil"
 license = "MIT"
 
 [component]
 file = "plugin.wasm"
-entrypoint = "sigil:s3/client@0.1.0"
+entrypoint = "sigil:s3/client@0.1.1"
 
 [requires]
 sigil = ">=0.31.0, <1.0.0"

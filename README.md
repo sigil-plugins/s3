@@ -7,30 +7,42 @@ binary Lua string.
 
 The first contract deliberately supports only anonymous requests and
 caller-supplied presigned query strings. It has no credential or clock import,
-does not follow redirects, never chooses a host or port, and accepts at most 16
-MiB per object. The logical endpoint name is also the HTTP `Host` authority, so
-presigned URLs must be generated for that in-environment name.
+does not follow redirects, never chooses a socket destination, and accepts at
+most 16 MiB per object. For a presigned request, `presigned-authority` carries
+the exact URL authority covered by the signature while `endpoint` still names
+the operator-granted socket route. Without it, the logical endpoint name remains
+the HTTP `Host` authority.
 
 ```lua
 local s3 = require("wasm.s3")
 
 local bytes, err = s3["get-object"]({
-  endpoint = "minio",
+  endpoint = "object-store",
   bucket = "results",
   key = "run/output.parquet",
+  ["presigned-query"] = query,
+  ["presigned-authority"] = "127.0.0.1:9000",
   ["max-bytes"] = 4 * 1024 * 1024,
 })
 expect(bytes ~= nil, err and err.message)
 ```
 
-The project grants the concrete route; plugin code sees only `minio`:
+The project grants the concrete route; plugin code sees only `object-store`:
 
 ```toml
-[plugins.grants.s3.network.minio]
+[plugins.grants.s3.network.object-store]
 target = "minio:9000"
 tls = "disabled"
 max_bytes = "4172KiB"
 ```
+
+`presigned-authority` is accepted only alongside `presigned-query`. It may be a
+DNS name, IPv4 address, or bracketed IPv6 address with an optional nonzero port;
+header injection, user-info, paths, and malformed ports are rejected before the
+network route is opened. The field changes the HTTP `Host` header only. It
+cannot redirect the TCP connection away from the route selected by the grant.
+Because some HTTP servers use `Host` for tenant selection, grant a dedicated
+route when the upstream does not isolate tenants independently.
 
 The endpoint quota counts both request and response wire bytes, including HTTP
 framing. Budget at least the requested object limit plus 64 KiB of response
@@ -39,7 +51,11 @@ percent-expanded key, endpoint, and HTTP framing). Reads follow `Content-Length`
 or chunked framing so a small final body fragment does not reserve another large
 block of quota.
 
-Install the official immutable release and add it to the current project:
+The currently published immutable release is 0.1.0. It does not yet have the
+separate `presigned-authority` field; build the 0.1.1 candidate from this source
+tree when validating that behavior before publication.
+
+Install the published release and add it to the current project:
 
 ```bash
 sigil plugin install s3@0.1.0

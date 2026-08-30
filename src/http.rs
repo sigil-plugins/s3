@@ -90,12 +90,46 @@ fn valid_presigned_query(query: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() && byte != b'#')
 }
 
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|value| value != 0)
+}
+
+fn valid_presigned_authority(authority: &str) -> bool {
+    if authority.is_empty() || authority.len() > 255 || !authority.is_ascii() {
+        return false;
+    }
+
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((address, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return address.parse::<std::net::Ipv6Addr>().is_ok()
+            && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_port));
+    }
+
+    let mut parts = authority.split(':');
+    let host = parts.next().unwrap_or_default();
+    let port = parts.next();
+    if parts.next().is_some()
+        || host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return false;
+    }
+    port.is_none_or(valid_port)
+}
+
 #[inline(never)]
 pub fn build_get_request(
     endpoint: &str,
     bucket: &str,
     key: &str,
     presigned_query: Option<&str>,
+    presigned_authority: Option<&str>,
     max_bytes: usize,
 ) -> Result<Vec<u8>, HttpError> {
     if !valid_endpoint(endpoint) || !valid_bucket(bucket) || key.is_empty() || key.len() > 1_024 {
@@ -116,6 +150,14 @@ pub fn build_get_request(
             "invalid presigned query",
         ));
     }
+    if presigned_authority.is_some_and(|authority| !valid_presigned_authority(authority))
+        || (presigned_authority.is_some() && presigned_query.is_none())
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "invalid presigned authority",
+        ));
+    }
 
     let mut target = String::with_capacity(bucket.len() + key.len() * 3 + MAX_QUERY_BYTES + 2);
     target.push('/');
@@ -127,10 +169,11 @@ pub fn build_get_request(
         target.push_str(query);
     }
 
-    let mut request = String::with_capacity(target.len() + endpoint.len() + 96);
+    let authority = presigned_authority.unwrap_or(endpoint);
+    let mut request = String::with_capacity(target.len() + authority.len() + 96);
     write!(
         request,
-        "GET {target} HTTP/1.1\r\nHost: {endpoint}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     )
     .map_err(|_error| {
         HttpError::new(
@@ -627,15 +670,78 @@ mod tests {
             "results",
             "folder/a b/é.parquet",
             Some("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc%2Fdef"),
+            Some("127.0.0.1:9000"),
             1024,
         )
         .expect("valid request");
         let request = String::from_utf8(request).expect("ASCII request");
         assert!(request.starts_with("GET /results/folder/a%20b/%C3%A9.parquet?X-Amz-Algorithm="));
-        assert!(request.contains("\r\nHost: minio\r\n"));
-        assert!(build_get_request("minio", "results.test", "key", None, 1).is_ok());
-        assert!(build_get_request("bad\r\nname", "results", "key", None, 1).is_err());
-        assert!(build_get_request("minio", "results", "key", Some("x=1\r\ny=2"), 1).is_err());
+        assert!(request.contains("X-Amz-Signature=abc%2Fdef HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nHost: 127.0.0.1:9000\r\n"));
+        assert!(build_get_request("minio", "results.test", "key", None, None, 1).is_ok());
+        assert!(build_get_request("bad\r\nname", "results", "key", None, None, 1).is_err());
+        assert!(build_get_request("minio", "results", "key", Some("x=1\r\ny=2"), None, 1).is_err());
+    }
+
+    #[test]
+    fn presigned_authority_is_bounded_and_cannot_select_the_socket_route() {
+        for authority in [
+            "minio.example:9000",
+            "127.0.0.1:9000",
+            "[2001:db8::1]:9000",
+            "localhost",
+        ] {
+            let request = build_get_request(
+                "operator-route",
+                "results",
+                "key",
+                Some("X-Amz-Signature=abc"),
+                Some(authority),
+                1,
+            )
+            .expect("valid authority");
+            let request = String::from_utf8(request).expect("ASCII request");
+            assert!(request.contains(&format!("\r\nHost: {authority}\r\n")));
+            assert!(!request.contains("Host: operator-route\r\n"));
+        }
+
+        for authority in [
+            "",
+            "example.com:0",
+            "example.com:+80",
+            "example.com:-1",
+            "example.com:65536",
+            "user@example.com",
+            "example.com/path",
+            "example.com\r\nX-Injected: yes",
+            "2001:db8::1",
+            "[not-ipv6]:9000",
+        ] {
+            assert!(
+                build_get_request(
+                    "operator-route",
+                    "results",
+                    "key",
+                    Some("X-Amz-Signature=abc"),
+                    Some(authority),
+                    1,
+                )
+                .is_err(),
+                "authority {authority:?} must be rejected"
+            );
+        }
+        assert!(
+            build_get_request(
+                "operator-route",
+                "results",
+                "key",
+                None,
+                Some("example.com"),
+                1,
+            )
+            .is_err(),
+            "an authority without a presigned query has no defined meaning"
+        );
     }
 
     #[test]

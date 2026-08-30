@@ -1,4 +1,4 @@
-package sigil:s3@0.1.0;
+package sigil:s3@0.1.1;
 
 interface client {
     enum error-class {
@@ -23,6 +23,7 @@ interface client {
         bucket: string,
         key: string,
         presigned-query: option<string>,
+        presigned-authority: option<string>,
         max-bytes: u32,
     }
 

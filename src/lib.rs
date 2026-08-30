@@ -68,6 +68,7 @@ fn get_object(options: &GetOptions) -> Result<Vec<u8>, Error> {
         &options.bucket,
         &options.key,
         options.presigned_query.as_deref(),
+        options.presigned_authority.as_deref(),
         max_bytes,
     )
     .map_err(|error| client_error(&error))?;
