@@ -1,0 +1,48 @@
+package sigil:host@1.1.0;
+
+/// One opaque, host-signed, read-only SigV4 exchange. The operator grant owns
+/// credentials, signing time, region, service, authority, and the bound route.
+interface sigv4 {
+    enum method {
+        get,
+        head,
+    }
+
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record request {
+        signing-grant: string,
+        method: method,
+        canonical-uri: string,
+        canonical-query: string,
+        headers: list<header>,
+        max-response-bytes: u64,
+    }
+
+    variant error {
+        denied,
+        invalid-request,
+        unavailable,
+        timeout,
+        tls,
+        io,
+        limit,
+        expired,
+        internal,
+    }
+
+    resource response {
+        read: func(max-bytes: u32) -> result<list<u8>, error>;
+        close: func();
+    }
+
+    exchange: func(request: request) -> result<response, error>;
+}
+
+/// Bindgen-only world used by Sigil to implement the additive v1.1 signer.
+world imports {
+    import sigv4;
+}

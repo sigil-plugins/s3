@@ -1,19 +1,20 @@
-schema_version = 1
+schema_version = 2
 name = "s3"
-version = "0.1.1"
-description = "bounded anonymous and presigned S3-compatible object reader for Sigil"
+version = "0.2.0"
+description = "bounded anonymous, presigned, and host-signed S3-compatible object reader for Sigil"
 license = "MIT"
 
 [component]
 file = "plugin.wasm"
-entrypoint = "sigil:s3/client@0.1.1"
+entrypoint = "sigil:s3/client@0.2.0"
 
 [requires]
-sigil = ">=0.31.0, <1.0.0"
-host_api = "^1.0"
+sigil = ">=0.33.0, <1.0.0"
+host_api = "^1.1"
 
 [capabilities]
 network = true
+sigv4 = true
 
 [repository]
 source = "github:sigil-plugins/s3"

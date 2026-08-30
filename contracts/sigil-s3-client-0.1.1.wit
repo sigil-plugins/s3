@@ -1,4 +1,4 @@
-package sigil:s3@0.2.0;
+package sigil:s3@0.1.1;
 
 interface client {
     enum error-class {
@@ -8,7 +8,6 @@ interface client {
         denied,
         not-found,
         server,
-        clock-skew,
         limit,
         unsupported,
     }
@@ -19,34 +18,19 @@ interface client {
         message: string,
     }
 
-    record anonymous-auth {
+    record get-options {
         endpoint: string,
-    }
-
-    record presigned-auth {
-        endpoint: string,
-        query: string,
-        authority: string,
-    }
-
-    variant auth {
-        anonymous(anonymous-auth),
-        presigned(presigned-auth),
-        sigv4(string),
-    }
-
-    record object-options {
         bucket: string,
         key: string,
-        auth: auth,
+        presigned-query: option<string>,
+        presigned-authority: option<string>,
         max-bytes: u32,
     }
 
-    get-object: func(options: object-options) -> result<list<u8>, error>;
+    get-object: func(options: get-options) -> result<list<u8>, error>;
 }
 
 world s3 {
     import sigil:host/net@1.0.0;
-    import sigil:host/sigv4@1.1.0;
     export client;
 }
