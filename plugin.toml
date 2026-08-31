@@ -1,7 +1,7 @@
 schema_version = 2
 name = "s3"
 version = "0.2.0"
-description = "bounded anonymous, presigned, and host-signed S3-compatible object reader for Sigil"
+description = "bounded anonymous, presigned, and host-signed S3-compatible object and metadata reader for Sigil"
 license = "MIT"
 
 [component]

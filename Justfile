@@ -2,6 +2,7 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 wasm_tools := env_var_or_default("WASM_TOOLS", "wasm-tools")
 sigil := env_var_or_default("SIGIL", "sigil")
+sigil_checkout := env_var_or_default("SIGIL_CHECKOUT", "")
 python := env_var_or_default("PYTHON", "python3")
 
 build:
@@ -33,3 +34,6 @@ release-dist source_commit: check
 
 reproducible:
     first="$(sha256sum plugin.wasm)"; just build; test "$first" = "$(sha256sum plugin.wasm)"
+
+live-head: dist
+    ./scripts/check-live-head.sh "{{sigil}}" "{{sigil_checkout}}"

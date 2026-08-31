@@ -88,17 +88,11 @@ fn push_encoded_key(output: &mut String, key: &str) {
 /// The host validates but does not normalize these bytes. Object-key slashes
 /// remain path separators; every other non-unreserved byte uses uppercase
 /// RFC 3986 percent encoding.
-pub fn build_canonical_uri(bucket: &str, key: &str, max_bytes: usize) -> Result<String, HttpError> {
+fn build_canonical_uri_unbounded(bucket: &str, key: &str) -> Result<String, HttpError> {
     if !valid_bucket(bucket) || key.is_empty() || key.len() > 1_024 {
         return Err(HttpError::new(
             HttpErrorKind::InvalidRequest,
             "invalid S3 bucket or key",
-        ));
-    }
-    if max_bytes == 0 || max_bytes > MAX_OBJECT_BYTES {
-        return Err(HttpError::new(
-            HttpErrorKind::Limit,
-            "requested object byte limit is outside the supported range",
         ));
     }
 
@@ -108,6 +102,20 @@ pub fn build_canonical_uri(bucket: &str, key: &str, max_bytes: usize) -> Result<
     uri.push('/');
     push_encoded_key(&mut uri, key);
     Ok(uri)
+}
+
+pub fn build_canonical_uri(bucket: &str, key: &str, max_bytes: usize) -> Result<String, HttpError> {
+    if max_bytes == 0 || max_bytes > MAX_OBJECT_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "requested object byte limit is outside the supported range",
+        ));
+    }
+    build_canonical_uri_unbounded(bucket, key)
+}
+
+pub fn build_head_canonical_uri(bucket: &str, key: &str) -> Result<String, HttpError> {
+    build_canonical_uri_unbounded(bucket, key)
 }
 
 /// Build the deliberately narrower canonical URI accepted by `SigV4` grants.
@@ -130,6 +138,18 @@ pub fn build_sigv4_canonical_uri(
         ));
     }
     build_canonical_uri(bucket, key, max_bytes)
+}
+
+pub fn build_sigv4_head_canonical_uri(bucket: &str, key: &str) -> Result<String, HttpError> {
+    if key.bytes().any(|byte| matches!(byte, b'%' | b'\\'))
+        || key.split('/').any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "object key is outside the supported SigV4 path shape",
+        ));
+    }
+    build_head_canonical_uri(bucket, key)
 }
 
 fn valid_presigned_query(query: &str) -> bool {
@@ -174,14 +194,14 @@ fn valid_presigned_authority(authority: &str) -> bool {
     port.is_none_or(valid_port)
 }
 
-#[inline(never)]
-pub fn build_get_request(
+fn build_request(
+    method: &str,
     endpoint: &str,
     bucket: &str,
     key: &str,
     presigned_query: Option<&str>,
     presigned_authority: Option<&str>,
-    max_bytes: usize,
+    max_bytes: Option<usize>,
 ) -> Result<Vec<u8>, HttpError> {
     if !valid_endpoint(endpoint) {
         return Err(HttpError::new(
@@ -204,7 +224,10 @@ pub fn build_get_request(
         ));
     }
 
-    let mut target = build_canonical_uri(bucket, key, max_bytes)?;
+    let mut target = max_bytes.map_or_else(
+        || build_head_canonical_uri(bucket, key),
+        |limit| build_canonical_uri(bucket, key, limit),
+    )?;
     if let Some(query) = presigned_query {
         target.push('?');
         target.push_str(query);
@@ -214,7 +237,7 @@ pub fn build_get_request(
     let mut request = String::with_capacity(target.len() + authority.len() + 96);
     write!(
         request,
-        "GET {target} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
     )
     .map_err(|_error| {
         HttpError::new(
@@ -223,6 +246,45 @@ pub fn build_get_request(
         )
     })?;
     Ok(request.into_bytes())
+}
+
+#[inline(never)]
+pub fn build_get_request(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    presigned_query: Option<&str>,
+    presigned_authority: Option<&str>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, HttpError> {
+    build_request(
+        "GET",
+        endpoint,
+        bucket,
+        key,
+        presigned_query,
+        presigned_authority,
+        Some(max_bytes),
+    )
+}
+
+#[inline(never)]
+pub fn build_head_request(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    presigned_query: Option<&str>,
+    presigned_authority: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    build_request(
+        "HEAD",
+        endpoint,
+        bucket,
+        key,
+        presigned_query,
+        presigned_authority,
+        None,
+    )
 }
 
 fn header_end(raw: &[u8]) -> Result<usize, HttpError> {
@@ -297,8 +359,29 @@ fn parse_status(line: &str) -> Result<u16, HttpError> {
 
 struct ResponseHeaders {
     status: u16,
-    content_length: Option<usize>,
+    content_length: Option<u64>,
     chunked: bool,
+    content_encoding: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectMetadata {
+    pub content_length: Option<u64>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+fn set_unique_metadata_header(
+    target: &mut Option<String>,
+    value: &str,
+    repeated_message: &'static str,
+) -> Result<(), HttpError> {
+    if target.replace(value.to_owned()).is_some() {
+        return Err(HttpError::new(HttpErrorKind::Protocol, repeated_message));
+    }
+    Ok(())
 }
 
 enum ChunkedProgress {
@@ -325,6 +408,8 @@ fn parse_headers(raw: &[u8], end: usize) -> Result<ResponseHeaders, HttpError> {
     let mut content_length = None;
     let mut transfer_encoding = None::<&str>;
     let mut content_encoding = None::<&str>;
+    let mut etag = None;
+    let mut last_modified = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -349,7 +434,7 @@ fn parse_headers(raw: &[u8], end: usize) -> Result<ResponseHeaders, HttpError> {
                     "S3 response repeats Content-Length",
                 ));
             }
-            content_length = Some(value.parse::<usize>().map_err(|_error| {
+            content_length = Some(value.parse::<u64>().map_err(|_error| {
                 HttpError::new(
                     HttpErrorKind::Protocol,
                     "S3 response has an invalid Content-Length",
@@ -369,18 +454,20 @@ fn parse_headers(raw: &[u8], end: usize) -> Result<ResponseHeaders, HttpError> {
                 HttpErrorKind::Protocol,
                 "S3 response repeats Content-Encoding",
             ));
+        } else if name.eq_ignore_ascii_case("etag") {
+            set_unique_metadata_header(&mut etag, value, "S3 response repeats ETag")?;
+        } else if name.eq_ignore_ascii_case("last-modified") {
+            set_unique_metadata_header(
+                &mut last_modified,
+                value,
+                "S3 response repeats Last-Modified",
+            )?;
         }
     }
     if content_length.is_some() && transfer_encoding.is_some() {
         return Err(HttpError::new(
             HttpErrorKind::Protocol,
             "S3 response mixes Content-Length and Transfer-Encoding",
-        ));
-    }
-    if content_encoding.is_some_and(|value| !value.eq_ignore_ascii_case("identity")) {
-        return Err(HttpError::new(
-            HttpErrorKind::Unsupported,
-            "compressed HTTP content encoding is unsupported",
         ));
     }
     let chunked = match transfer_encoding {
@@ -397,7 +484,24 @@ fn parse_headers(raw: &[u8], end: usize) -> Result<ResponseHeaders, HttpError> {
         status,
         content_length,
         chunked,
+        content_encoding: content_encoding.map(str::to_owned),
+        etag,
+        last_modified,
     })
+}
+
+fn validate_get_content_encoding(headers: &ResponseHeaders) -> Result<(), HttpError> {
+    if headers
+        .content_encoding
+        .as_deref()
+        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"))
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::Unsupported,
+            "compressed HTTP content encoding is unsupported",
+        ));
+    }
+    Ok(())
 }
 
 const fn status_error(status: u16) -> Option<HttpError> {
@@ -538,6 +642,30 @@ pub fn next_signed_read_size(raw: &[u8], max_bytes: usize) -> Result<Option<usiz
     next_read_size_impl(raw, max_bytes, true)
 }
 
+/// Return the next bounded read needed for a HEAD response.
+///
+/// Once the complete header arrives this returns `None`; it never requests an
+/// object body. Any body bytes already delivered with the header fail closed.
+pub fn next_head_read_size(raw: &[u8]) -> Result<Option<usize>, HttpError> {
+    let Some(offset) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        if raw.len() >= MAX_HEADER_BYTES {
+            return Err(HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 response header exceeds the byte limit",
+            ));
+        }
+        return Ok(Some(MAX_HEADER_BYTES - raw.len()));
+    };
+    let end = offset + 4;
+    if end > MAX_HEADER_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 response header exceeds the byte limit",
+        ));
+    }
+    decode_head_response(raw).map(|_metadata| None)
+}
+
 fn next_read_size_impl(
     raw: &[u8],
     max_bytes: usize,
@@ -560,10 +688,11 @@ fn next_read_size_impl(
         ));
     }
     let headers = parse_headers(raw, end)?;
+    validate_get_content_encoding(&headers)?;
     let body_limit = response_body_limit(headers.status, max_bytes, read_s3_error)?;
     if headers
         .content_length
-        .is_some_and(|length| length > body_limit)
+        .is_some_and(|length| length > body_limit as u64)
     {
         return Err(HttpError::new(
             HttpErrorKind::Limit,
@@ -577,6 +706,12 @@ fn next_read_size_impl(
         };
     }
     if let Some(content_length) = headers.content_length {
+        let content_length = usize::try_from(content_length).map_err(|_error| {
+            HttpError::new(
+                HttpErrorKind::Limit,
+                "S3 object byte count is not representable",
+            )
+        })?;
         let expected = end.checked_add(content_length).ok_or_else(|| {
             HttpError::new(HttpErrorKind::Limit, "S3 response byte count overflowed")
         })?;
@@ -707,6 +842,35 @@ pub fn decode_signed_response(raw: &[u8], max_bytes: usize) -> Result<Vec<u8>, H
     decode_response_impl(raw, max_bytes, true)
 }
 
+/// Decode a successful HEAD response without reading or synthesizing a body.
+///
+/// Metadata strings are returned after HTTP optional whitespace is removed,
+/// exactly as supplied otherwise. Missing values remain distinguishable.
+pub fn decode_head_response(raw: &[u8]) -> Result<ObjectMetadata, HttpError> {
+    let end = header_end(raw)?;
+    let headers = parse_headers(raw, end)?;
+    if raw.len() != end {
+        return Err(HttpError::new(
+            HttpErrorKind::Protocol,
+            "S3 HEAD response unexpectedly contains body bytes",
+        ));
+    }
+    if headers.chunked {
+        return Err(HttpError::new(
+            HttpErrorKind::Protocol,
+            "S3 HEAD response uses transfer framing",
+        ));
+    }
+    if let Some(error) = status_error(headers.status) {
+        return Err(error);
+    }
+    Ok(ObjectMetadata {
+        content_length: headers.content_length,
+        etag: headers.etag,
+        last_modified: headers.last_modified,
+    })
+}
+
 fn decode_response_impl(
     raw: &[u8],
     max_bytes: usize,
@@ -714,10 +878,11 @@ fn decode_response_impl(
 ) -> Result<Vec<u8>, HttpError> {
     let end = header_end(raw)?;
     let headers = parse_headers(raw, end)?;
+    validate_get_content_encoding(&headers)?;
     let body_limit = response_body_limit(headers.status, max_bytes, read_s3_error)?;
     if headers
         .content_length
-        .is_some_and(|length| length > body_limit)
+        .is_some_and(|length| length > body_limit as u64)
     {
         return Err(HttpError::new(
             HttpErrorKind::Limit,
@@ -729,7 +894,7 @@ fn decode_response_impl(
         decode_chunked(body, body_limit)?
     } else {
         if let Some(expected) = headers.content_length
-            && expected != body.len()
+            && expected != body.len() as u64
         {
             return Err(HttpError::new(
                 HttpErrorKind::Protocol,
@@ -808,6 +973,25 @@ mod tests {
     }
 
     #[test]
+    fn head_request_preserves_auth_authority_and_has_no_body() {
+        let request = build_head_request(
+            "operator-route",
+            "results",
+            "exports/capi.parquet",
+            Some("X-Amz-Credential=key%2Fscope&X-Amz-Signature=abc"),
+            Some("127.0.0.1:9000"),
+        )
+        .expect("valid presigned HEAD request");
+        let request = String::from_utf8(request).expect("ASCII request");
+        assert_eq!(
+            request,
+            "HEAD /results/exports/capi.parquet?X-Amz-Credential=key%2Fscope&X-Amz-Signature=abc HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        );
+        assert!(!request.contains("Host: operator-route"));
+        assert!(!request.contains("GET "));
+    }
+
+    #[test]
     fn presigned_authority_is_bounded_and_cannot_select_the_socket_route() {
         for authority in [
             "minio.example:9000",
@@ -877,6 +1061,169 @@ mod tests {
         assert_eq!(
             decode_response(&chunked, 4).expect("chunked body"),
             b"\0\xffAB"
+        );
+    }
+
+    #[test]
+    fn head_metadata_is_optional_exact_and_unnormalized() {
+        let full = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\nETag:\t\"abc-2\" \r\nLast-Modified: Sun, 30 Aug 2026 23:59:01 GMT\r\nContent-Encoding: gzip\r\n\r\n";
+        assert_eq!(
+            decode_head_response(full).expect("complete metadata"),
+            ObjectMetadata {
+                content_length: Some(u64::MAX),
+                etag: Some("\"abc-2\"".to_owned()),
+                last_modified: Some("Sun, 30 Aug 2026 23:59:01 GMT".to_owned()),
+            }
+        );
+
+        let absent = b"HTTP/1.1 200 OK\r\nDate: Sun, 30 Aug 2026 23:59:01 GMT\r\n\r\n";
+        assert_eq!(
+            decode_head_response(absent).expect("missing metadata remains explicit"),
+            ObjectMetadata {
+                content_length: None,
+                etag: None,
+                last_modified: None,
+            }
+        );
+
+        let zero = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            decode_head_response(zero)
+                .expect("present zero content length remains distinguishable")
+                .content_length,
+            Some(0)
+        );
+
+        let empty = b"HTTP/1.1 200 OK\r\nETag:\r\nLast-Modified:\r\n\r\n";
+        assert_eq!(
+            decode_head_response(empty).expect("present empty values remain present"),
+            ObjectMetadata {
+                content_length: None,
+                etag: Some(String::new()),
+                last_modified: Some(String::new()),
+            }
+        );
+    }
+
+    #[test]
+    fn head_rejects_ambiguous_metadata_framing_and_body_bytes() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nETag: one\r\nETag: two\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nLast-Modified: one\r\nLast-Modified: two\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nX".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nETag: \xff\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nETag: one\r\n two\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nETag: one\x01two\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nBad Name: value\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                decode_head_response(raw).is_err(),
+                "hostile HEAD response must fail: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_statuses_are_typed_without_metadata_or_payload_fallback() {
+        for (status, kind) in [
+            (100, HttpErrorKind::Protocol),
+            (204, HttpErrorKind::Protocol),
+            (301, HttpErrorKind::Unsupported),
+            (401, HttpErrorKind::Denied),
+            (403, HttpErrorKind::Denied),
+            (404, HttpErrorKind::NotFound),
+            (500, HttpErrorKind::Server),
+            (599, HttpErrorKind::Server),
+        ] {
+            let raw = format!(
+                "HTTP/1.1 {status} Status\r\nContent-Length: 7\r\nETag: do-not-return\r\n\r\n"
+            );
+            let error = decode_head_response(raw.as_bytes()).expect_err("status must fail");
+            assert_eq!(error.kind, kind);
+            assert_eq!(error.status, Some(status));
+            assert!(!error.message.contains("do-not-return"));
+        }
+
+        let with_error_body = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\nsecret";
+        let error = decode_head_response(with_error_body)
+            .expect_err("HEAD must not consume or expose an upstream body");
+        assert_eq!(error.kind, HttpErrorKind::Protocol);
+        assert!(!error.message.contains("secret"));
+    }
+
+    #[test]
+    fn head_reads_only_a_bounded_complete_header() {
+        assert_eq!(
+            next_head_read_size(b"").expect("empty response"),
+            Some(MAX_HEADER_BYTES)
+        );
+        let partial = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n";
+        assert_eq!(
+            next_head_read_size(partial).expect("partial header"),
+            Some(MAX_HEADER_BYTES - partial.len())
+        );
+        let complete = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n";
+        assert_eq!(
+            next_head_read_size(complete).expect("complete header"),
+            None
+        );
+        let mut body = complete.to_vec();
+        body.push(b'X');
+        assert_eq!(
+            next_head_read_size(&body)
+                .expect_err("coalesced body byte must fail")
+                .kind,
+            HttpErrorKind::Protocol
+        );
+
+        let no_terminator = vec![b'A'; MAX_HEADER_BYTES];
+        assert_eq!(
+            next_head_read_size(&no_terminator)
+                .expect_err("aggregate header limit must fail")
+                .kind,
+            HttpErrorKind::Limit
+        );
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nX-Fill: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        assert_eq!(
+            decode_head_response(oversized.as_bytes())
+                .expect_err("terminated oversized header must fail")
+                .kind,
+            HttpErrorKind::Limit
+        );
+
+        let fixed_prefix = "HTTP/1.1 200 OK\r\nX-Fill: ";
+        let fixed_suffix = "\r\n\r\n";
+        let exact = format!(
+            "{fixed_prefix}{}{fixed_suffix}",
+            "a".repeat(MAX_HEADER_BYTES - fixed_prefix.len() - fixed_suffix.len())
+        );
+        assert_eq!(exact.len(), MAX_HEADER_BYTES);
+        assert_eq!(
+            next_head_read_size(exact.as_bytes()).expect("exact cap is accepted"),
+            None
+        );
+        assert!(decode_head_response(exact.as_bytes()).is_ok());
+
+        let over_by_one = format!(
+            "{fixed_prefix}{}{fixed_suffix}",
+            "a".repeat(MAX_HEADER_BYTES + 1 - fixed_prefix.len() - fixed_suffix.len())
+        );
+        assert_eq!(over_by_one.len(), MAX_HEADER_BYTES + 1);
+        assert_eq!(
+            next_head_read_size(over_by_one.as_bytes())
+                .expect_err("cap plus one must fail")
+                .kind,
+            HttpErrorKind::Limit
         );
     }
 

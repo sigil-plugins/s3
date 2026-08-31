@@ -11,11 +11,14 @@ mod bindings {
 
 mod http;
 
-use bindings::exports::sigil::s3::client::{Auth, Error, ErrorClass, Guest, ObjectOptions};
+use bindings::exports::sigil::s3::client::{
+    Auth, Error, ErrorClass, Guest, HeadOptions, ObjectMetadata, ObjectOptions,
+};
 use bindings::sigil::{host1_0_0::net, host1_1_0::sigv4};
 use http::{HttpError, HttpErrorKind};
 
 const HOST_READ_BYTES: u32 = 1024 * 1024;
+const HEAD_RESPONSE_BYTES: u32 = 32 * 1024;
 
 struct S3;
 
@@ -201,6 +204,94 @@ fn build_sigv4_request(
     })
 }
 
+fn build_sigv4_head_request(
+    signing_grant: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<sigv4::Request, Error> {
+    if !valid_signing_grant(signing_grant) {
+        return Err(Error {
+            class: ErrorClass::InvalidRequest,
+            status: None,
+            message: "invalid SigV4 signing grant".to_owned(),
+        });
+    }
+    let canonical_uri =
+        http::build_sigv4_head_canonical_uri(bucket, key).map_err(|error| client_error(&error))?;
+    Ok(sigv4::Request {
+        signing_grant: signing_grant.to_owned(),
+        method: sigv4::Method::Head,
+        canonical_uri,
+        canonical_query: String::new(),
+        headers: Vec::new(),
+        max_response_bytes: u64::from(HEAD_RESPONSE_BYTES),
+    })
+}
+
+fn raw_head_object(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    query: Option<&str>,
+    authority: Option<&str>,
+) -> Result<ObjectMetadata, Error> {
+    let request = http::build_head_request(endpoint, bucket, key, query, authority)
+        .map_err(|error| client_error(&error))?;
+    let stream = net::connect(endpoint).map_err(net_error)?;
+    let result = (|| {
+        stream.write_all(&request).map_err(net_error)?;
+        stream.flush().map_err(net_error)?;
+        read_head_metadata(|requested| stream.read(requested).map_err(net_error))
+    })();
+    stream.close();
+    result
+}
+
+fn signed_head_object(
+    signing_grant: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<ObjectMetadata, Error> {
+    let request = build_sigv4_head_request(signing_grant, bucket, key)?;
+    let response = sigv4::exchange(&request).map_err(sigv4_error)?;
+    let result = read_head_metadata(|requested| response.read(requested).map_err(sigv4_error));
+    response.close();
+    result
+}
+
+fn read_head_metadata(
+    mut read: impl FnMut(u32) -> Result<Vec<u8>, Error>,
+) -> Result<ObjectMetadata, Error> {
+    let mut raw = Vec::new();
+    while let Some(useful) =
+        http::next_head_read_size(&raw).map_err(|error| client_error(&error))?
+    {
+        let requested = u32::try_from(useful).map_err(|_error| Error {
+            class: ErrorClass::Limit,
+            status: None,
+            message: "S3 HEAD read size is not representable".to_owned(),
+        })?;
+        let chunk = read(requested)?;
+        if chunk.is_empty() {
+            break;
+        }
+        raw.extend_from_slice(&chunk);
+        if raw.len() > http::MAX_HEADER_BYTES {
+            return Err(Error {
+                class: ErrorClass::Limit,
+                status: None,
+                message: "S3 HEAD response exceeds the header byte limit".to_owned(),
+            });
+        }
+    }
+    let metadata = http::decode_head_response(&raw).map_err(|error| client_error(&error))?;
+    Ok(ObjectMetadata {
+        content_length: metadata.content_length,
+        etag: metadata.etag,
+        last_modified: metadata.last_modified,
+    })
+}
+
 fn signed_get_object(
     signing_grant: &str,
     bucket: &str,
@@ -274,9 +365,32 @@ fn get_object(options: &ObjectOptions) -> Result<Vec<u8>, Error> {
     }
 }
 
+#[inline(never)]
+fn head_object(options: &HeadOptions) -> Result<ObjectMetadata, Error> {
+    match &options.auth {
+        Auth::Anonymous(auth) => {
+            raw_head_object(&auth.endpoint, &options.bucket, &options.key, None, None)
+        }
+        Auth::Presigned(auth) => raw_head_object(
+            &auth.endpoint,
+            &options.bucket,
+            &options.key,
+            Some(&auth.query),
+            Some(&auth.authority),
+        ),
+        Auth::Sigv4(signing_grant) => {
+            signed_head_object(signing_grant, &options.bucket, &options.key)
+        }
+    }
+}
+
 impl Guest for S3 {
     fn get_object(options: ObjectOptions) -> Result<Vec<u8>, Error> {
         get_object(&options)
+    }
+
+    fn head_object(options: HeadOptions) -> Result<ObjectMetadata, Error> {
+        head_object(&options)
     }
 }
 
@@ -371,6 +485,51 @@ mod tests {
             request.max_response_bytes,
             4 * 1024 * 1024 + http::MAX_WIRE_OVERHEAD_BYTES as u64
         );
+    }
+
+    #[test]
+    fn sigv4_head_uses_the_fixed_header_bound_and_no_get_authority() {
+        let request =
+            build_sigv4_head_request("private-results", "examplebucket", "exports/capi.parquet")
+                .expect("valid signed HEAD request");
+        assert_eq!(request.signing_grant, "private-results");
+        assert_eq!(request.method, sigv4::Method::Head);
+        assert_eq!(request.canonical_uri, "/examplebucket/exports/capi.parquet");
+        assert!(request.canonical_query.is_empty());
+        assert!(request.headers.is_empty());
+        assert_eq!(request.max_response_bytes, u64::from(HEAD_RESPONSE_BYTES));
+        assert_eq!(HEAD_RESPONSE_BYTES as usize, http::MAX_HEADER_BYTES);
+        assert_ne!(
+            request.max_response_bytes,
+            u64::try_from(wire_limit(4 * 1024 * 1024).expect("GET wire bound"))
+                .expect("u64 GET wire bound")
+        );
+    }
+
+    #[test]
+    fn head_reader_never_reads_after_the_complete_header() {
+        let mut reads = Vec::new();
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nETag: \"exact\"\r\nLast-Modified: raw value\r\n\r\n"
+                .to_vec();
+        let metadata = read_head_metadata(|requested| {
+            reads.push(requested);
+            Ok(response.clone())
+        })
+        .expect("complete HEAD metadata");
+        assert_eq!(reads, vec![HEAD_RESPONSE_BYTES]);
+        assert_eq!(metadata.content_length, Some(7));
+        assert_eq!(metadata.etag.as_deref(), Some("\"exact\""));
+        assert_eq!(metadata.last_modified.as_deref(), Some("raw value"));
+
+        let mut body_reads = 0;
+        let error = read_head_metadata(|_requested| {
+            body_reads += 1;
+            Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nX".to_vec())
+        })
+        .expect_err("coalesced body byte must fail without another read");
+        assert_eq!(body_reads, 1);
+        assert_eq!(error.class, ErrorClass::Protocol);
     }
 
     #[test]

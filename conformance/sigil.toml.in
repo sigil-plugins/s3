@@ -1,0 +1,50 @@
+[deploy]
+backend = "external"
+
+[plugins]
+allow_third_party = true
+
+[plugins.trust]
+install_allowlist = ["github:conformance/s3"]
+
+[plugins.trust.capability_allowlist]
+network = ["github:conformance/s3"]
+sigv4 = ["github:conformance/s3"]
+
+[plugins.require]
+s3 = { version = "=0.2.0", source = "github:conformance/s3" }
+
+[plugins.grants.s3.network.object-store]
+target = "object-store:9000"
+tls = "disabled"
+connect_timeout = "5s"
+io_timeout = "5s"
+max_connections = 8
+max_bytes = "512KiB"
+
+[plugins.grants.s3.sigv4.private-read]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_SECRET_KEY"
+region = "us-east-1"
+service = "s3"
+authority = "@AUTHORITY@"
+methods = ["HEAD"]
+canonical_uri_prefixes = ["/private-results/"]
+query = {}
+header_names = []
+
+[plugins.grants.s3.sigv4.wrong-private-read]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_WRONG_SECRET"
+region = "us-east-1"
+service = "s3"
+authority = "@AUTHORITY@"
+methods = ["HEAD"]
+canonical_uri_prefixes = ["/private-results/"]
+query = {}
+header_names = []
+
+[plugins.runtime]
+max_call_seconds = 10
