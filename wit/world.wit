@@ -42,7 +42,25 @@ interface client {
         max-bytes: u32,
     }
 
+    /// HEAD is bounded by the fixed response-header cap rather than by the
+    /// represented object's size, so it has no object byte limit input.
+    record head-options {
+        bucket: string,
+        key: string,
+        auth: auth,
+    }
+
+    /// Metadata returned exactly as the S3-compatible server supplied it.
+    /// Missing headers remain `none`; Last-Modified is never parsed or
+    /// normalized by the plugin.
+    record object-metadata {
+        content-length: option<u64>,
+        etag: option<string>,
+        last-modified: option<string>,
+    }
+
     get-object: func(options: object-options) -> result<list<u8>, error>;
+    head-object: func(options: head-options) -> result<object-metadata, error>;
 }
 
 world s3 {
