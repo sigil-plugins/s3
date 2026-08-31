@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "sigil-plugin-s3"
-version = "0.2.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "wit-bindgen",
 ]

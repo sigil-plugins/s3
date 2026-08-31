@@ -29,8 +29,8 @@ readonly ENGINE
 
 MINIO_IMAGE="quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
 MC_IMAGE="quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
-EXPECTED_COMPONENT_SHA256="c64cb28374c112724b1cc0b2a0a1c627ae06ae18cdda61d5918554c3c1b7fa69"
-EXPECTED_PACKAGE_SHA256="a655eda263848ab9da88ba19710fb447579ff24ed071cb696f3e80d70be7d7c2"
+EXPECTED_COMPONENT_SHA256="4388f375d3088d50d69ee077553ee9f543031ab03299f3254f02c56f82ebee43"
+EXPECTED_PACKAGE_SHA256="e1c26a1de940115fa56d86ea823616f33eafe05b5bbdc6f750fdeb11d7880b19"
 readonly MINIO_IMAGE MC_IMAGE EXPECTED_COMPONENT_SHA256 EXPECTED_PACKAGE_SHA256
 
 MINIO_USER="sigilheadaccess"
@@ -78,9 +78,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-sha256sum plugin.wasm dist/s3-0.2.0.sigil-plugin.tar.zst >"$EVIDENCE/candidate.sha256"
+sha256sum plugin.wasm dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst >"$EVIDENCE/candidate.sha256"
 [[ "$(sha256sum plugin.wasm | cut -d' ' -f1)" == "$EXPECTED_COMPONENT_SHA256" ]]
-[[ "$(sha256sum dist/s3-0.2.0.sigil-plugin.tar.zst | cut -d' ' -f1)" == "$EXPECTED_PACKAGE_SHA256" ]]
+[[ "$(sha256sum dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst | cut -d' ' -f1)" == "$EXPECTED_PACKAGE_SHA256" ]]
 
 "$ENGINE" pull "$MINIO_IMAGE" >"$EVIDENCE/minio.pull.txt"
 "$ENGINE" pull "$MC_IMAGE" >"$EVIDENCE/mc.pull.txt"
@@ -213,8 +213,8 @@ cargo generate-lockfile --quiet --offline --manifest-path "$SCRATCH/seeder/Cargo
 CARGO_TARGET_DIR="$ROOT/target/sigil-compat-seed" \
   cargo run --quiet --locked --offline --manifest-path "$SCRATCH/seeder/Cargo.toml" -- \
   "$SCRATCH/data" \
-  "$SCRATCH/package/dist/s3-0.2.0.sigil-plugin.tar.zst" \
-  github:conformance/s3 s3 0.2.0 s3-head-live-0.2.0
+  "$SCRATCH/package/dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst" \
+  github:conformance/s3 s3 0.2.0-rc.1 s3-head-live-0.2.0-rc.1
 
 python3 - "$ROOT/conformance/sigil.toml.in" "$SCRATCH/project/.sigil/sigil.toml" "$authority" <<'PY'
 from pathlib import Path
@@ -300,7 +300,7 @@ printf '%s\n' \
   "component_sha256=$EXPECTED_COMPONENT_SHA256" \
   "component_blake3=$(b3sum plugin.wasm | cut -d' ' -f1)" \
   "package_sha256=$EXPECTED_PACKAGE_SHA256" \
-  "package_blake3=$(b3sum dist/s3-0.2.0.sigil-plugin.tar.zst | cut -d' ' -f1)" \
+  "package_blake3=$(b3sum dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst | cut -d' ' -f1)" \
   "minio_image=$MINIO_IMAGE" \
   "minio_image_id=$("$ENGINE" image inspect --format '{{.Id}}' "$MINIO_IMAGE")" \
   "mc_image=$MC_IMAGE" \
