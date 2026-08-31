@@ -78,9 +78,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-sha256sum plugin.wasm dist/s3-0.2.0.sigil-plugin.tar.zst >"$EVIDENCE/candidate.sha256"
+sha256sum plugin.wasm dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst >"$EVIDENCE/candidate.sha256"
 [[ "$(sha256sum plugin.wasm | cut -d' ' -f1)" == "$EXPECTED_COMPONENT_SHA256" ]]
-[[ "$(sha256sum dist/s3-0.2.0.sigil-plugin.tar.zst | cut -d' ' -f1)" == "$EXPECTED_PACKAGE_SHA256" ]]
+[[ "$(sha256sum dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst | cut -d' ' -f1)" == "$EXPECTED_PACKAGE_SHA256" ]]
 
 "$ENGINE" pull "$MINIO_IMAGE" >"$EVIDENCE/minio.pull.txt"
 "$ENGINE" pull "$MC_IMAGE" >"$EVIDENCE/mc.pull.txt"
@@ -213,8 +213,8 @@ cargo generate-lockfile --quiet --offline --manifest-path "$SCRATCH/seeder/Cargo
 CARGO_TARGET_DIR="$ROOT/target/sigil-compat-seed" \
   cargo run --quiet --locked --offline --manifest-path "$SCRATCH/seeder/Cargo.toml" -- \
   "$SCRATCH/data" \
-  "$SCRATCH/package/dist/s3-0.2.0.sigil-plugin.tar.zst" \
-  github:conformance/s3 s3 0.2.0 s3-head-live-0.2.0
+  "$SCRATCH/package/dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst" \
+  github:conformance/s3 s3 0.2.0-rc.1 s3-head-live-0.2.0-rc.1
 
 python3 - "$ROOT/conformance/sigil.toml.in" "$SCRATCH/project/.sigil/sigil.toml" "$authority" <<'PY'
 from pathlib import Path
@@ -300,7 +300,7 @@ printf '%s\n' \
   "component_sha256=$EXPECTED_COMPONENT_SHA256" \
   "component_blake3=$(b3sum plugin.wasm | cut -d' ' -f1)" \
   "package_sha256=$EXPECTED_PACKAGE_SHA256" \
-  "package_blake3=$(b3sum dist/s3-0.2.0.sigil-plugin.tar.zst | cut -d' ' -f1)" \
+  "package_blake3=$(b3sum dist/s3-0.2.0-rc.1.sigil-plugin.tar.zst | cut -d' ' -f1)" \
   "minio_image=$MINIO_IMAGE" \
   "minio_image_id=$("$ENGINE" image inspect --format '{{.Id}}' "$MINIO_IMAGE")" \
   "mc_image=$MC_IMAGE" \

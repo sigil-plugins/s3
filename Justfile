@@ -14,7 +14,10 @@ build:
 sdk-drift:
     ./scripts/check-sdk-lock.sh
 
-check: sdk-drift
+release-workflow:
+    {{python}} scripts/check-release-workflow.py
+
+check: sdk-drift release-workflow
     cargo fmt --all -- --check
     cargo test --locked
     cargo clippy --all-targets --locked -- -D warnings
