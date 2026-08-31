@@ -93,7 +93,7 @@ jobs:
           RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
+          prerelease="$(python3 -I scripts/release_version.py "$VERSION")"
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$PACKAGE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$CHECKSUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -142,8 +142,11 @@ jobs:
           ).encode("ascii")
           assert raw == canonical
           PY
-          echo "package_name=$package" >> "$GITHUB_OUTPUT"
-          echo "subject_digest=sha256:$PACKAGE_SHA256" >> "$GITHUB_OUTPUT"
+          {
+            echo "package_name=$package"
+            echo "subject_digest=sha256:$PACKAGE_SHA256"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
       - name: Stage and read back the exact draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -153,6 +156,7 @@ jobs:
           CHECKSUMS_SHA256: ${{ inputs.checksums_sha256 }}
           RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
           PACKAGE_NAME: ${{ steps.release.outputs.package_name }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
@@ -171,12 +175,12 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/attestations/sha256:${PACKAGE_SHA256}?predicate_type=provenance&per_page=30")"
           test "$status" = 404
-          prerelease=false
           prerelease_flag=()
-          if [[ "$VERSION" == *-* ]]; then
-            prerelease=true
-            prerelease_flag=(--prerelease)
-          fi
+          case "$PRERELEASE" in
+            true) prerelease_flag=(--prerelease) ;;
+            false) ;;
+            *) echo "invalid prerelease classification" >&2; exit 1 ;;
+          esac
           gh release create "$tag" \
             --target "$SOURCE_COMMIT" \
             --title "${PACKAGE_NAME%.sigil-plugin.tar.zst}" \
@@ -186,7 +190,7 @@ jobs:
             "dist/$PACKAGE_NAME" dist/SHA256SUMS dist/release-manifest.json
           release_json="$(mktemp)"
           gh release view "$tag" --json isDraft,isPrerelease,targetCommitish,assets > "$release_json"
-          jq -e --arg commit "$SOURCE_COMMIT" --arg package "$PACKAGE_NAME" --argjson prerelease "$prerelease" '
+          jq -e --arg commit "$SOURCE_COMMIT" --arg package "$PACKAGE_NAME" --argjson prerelease "$PRERELEASE" '
             .isDraft == true and .isPrerelease == $prerelease and .targetCommitish == $commit and
             ([.assets[].name] | sort) == (["SHA256SUMS", "release-manifest.json", $package] | sort)
           ' "$release_json" >/dev/null
@@ -214,6 +218,7 @@ jobs:
           CHECKSUMS_SHA256: ${{ inputs.checksums_sha256 }}
           RELEASE_MANIFEST_SHA256: ${{ inputs.release_manifest_sha256 }}
           PACKAGE_NAME: ${{ steps.release.outputs.package_name }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
           ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: |
@@ -240,11 +245,10 @@ jobs:
           done
           test "$attestation_found" = true
           tag="v${VERSION}"
-          prerelease=false
-          [[ "$VERSION" != *-* ]] || prerelease=true
+          case "$PRERELEASE" in true|false) ;; *) exit 1 ;; esac
           release_json="$(mktemp)"
           gh release view "$tag" --json isDraft,isPrerelease,targetCommitish > "$release_json"
-          jq -e --arg commit "$SOURCE_COMMIT" --argjson prerelease "$prerelease" '
+          jq -e --arg commit "$SOURCE_COMMIT" --argjson prerelease "$PRERELEASE" '
             .isDraft == true and .isPrerelease == $prerelease and .targetCommitish == $commit
           ' "$release_json" >/dev/null
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
@@ -267,7 +271,7 @@ jobs:
           test "$immutable" = true
           release_json="$(mktemp)"
           gh release view "$tag" --json isDraft,isPrerelease > "$release_json"
-          jq -e --argjson prerelease "$prerelease" '
+          jq -e --argjson prerelease "$PRERELEASE" '
             .isDraft == false and .isPrerelease == $prerelease
           ' "$release_json" >/dev/null
           readback="$(mktemp -d)"
