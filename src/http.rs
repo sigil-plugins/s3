@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::{collections::BTreeSet, fmt::Write as _};
 
 pub const MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -6,6 +6,9 @@ pub const MAX_WIRE_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_S3_ERROR_BODY_BYTES: usize = 32 * 1024;
 const MAX_QUERY_BYTES: usize = 8 * 1024;
 const MAX_CHUNKS: usize = 4_096;
+pub const MAX_LIST_KEYS: u32 = 1_000;
+pub const MAX_LIST_PREFIX_BYTES: usize = 1_024;
+pub const MAX_CONTINUATION_TOKEN_BYTES: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpErrorKind {
@@ -74,6 +77,19 @@ fn push_encoded_key(output: &mut String, key: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in key.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+}
+
+fn push_encoded_query_value(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             output.push(char::from(byte));
         } else {
             output.push('%');
@@ -152,6 +168,75 @@ pub fn build_sigv4_head_canonical_uri(bucket: &str, key: &str) -> Result<String,
     build_head_canonical_uri(bucket, key)
 }
 
+/// Build the exact path-style bucket URI used by `ListObjectsV2`.
+pub fn build_list_canonical_uri(bucket: &str) -> Result<String, HttpError> {
+    if !valid_bucket(bucket) {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "invalid S3 bucket for object listing",
+        ));
+    }
+    Ok(format!("/{bucket}/"))
+}
+
+fn validate_list_inputs(
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> Result<(), HttpError> {
+    if prefix.is_empty() || prefix.len() > MAX_LIST_PREFIX_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "S3 list prefix is outside the supported range",
+        ));
+    }
+    if !(1..=MAX_LIST_KEYS).contains(&max_keys) {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 list max-keys is outside the supported range",
+        ));
+    }
+    if continuation_token
+        .is_some_and(|token| token.is_empty() || token.len() > MAX_CONTINUATION_TOKEN_BYTES)
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 continuation token is outside the supported range",
+        ));
+    }
+    Ok(())
+}
+
+/// Build a strict RFC 3986 canonical `ListObjectsV2` query. Fields are emitted
+/// in byte-sorted name order, including the caller's optional continuation.
+pub fn build_list_query(
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> Result<String, HttpError> {
+    validate_list_inputs(prefix, max_keys, continuation_token)?;
+    let mut query = String::with_capacity(prefix.len().saturating_mul(3).saturating_add(96));
+    if let Some(token) = continuation_token {
+        query.push_str("continuation-token=");
+        push_encoded_query_value(&mut query, token);
+        query.push('&');
+    }
+    write!(query, "list-type=2&max-keys={max_keys}&prefix=").map_err(|_error| {
+        HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 list query construction exceeded a fixed limit",
+        )
+    })?;
+    push_encoded_query_value(&mut query, prefix);
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 list query exceeds the byte limit",
+        ));
+    }
+    Ok(query)
+}
+
 fn valid_presigned_query(query: &str) -> bool {
     !query.is_empty()
         && query.len() <= MAX_QUERY_BYTES
@@ -159,6 +244,53 @@ fn valid_presigned_query(query: &str) -> bool {
         && query
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && byte != b'#')
+}
+
+fn presigned_list_query_matches(
+    query: &str,
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> bool {
+    if !valid_presigned_query(query)
+        || validate_list_inputs(prefix, max_keys, continuation_token).is_err()
+    {
+        return false;
+    }
+    let mut fields = Vec::new();
+    let mut names = BTreeSet::new();
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            return false;
+        };
+        if name.is_empty() || !names.insert(name) {
+            return false;
+        }
+        fields.push((name, value));
+    }
+    let lookup = |name: &str| {
+        fields
+            .iter()
+            .find_map(|(field, value)| (*field == name).then_some(*value))
+    };
+
+    let mut encoded_prefix = String::new();
+    push_encoded_query_value(&mut encoded_prefix, prefix);
+    let expected_max_keys = max_keys.to_string();
+    if lookup("list-type") != Some("2")
+        || lookup("max-keys") != Some(expected_max_keys.as_str())
+        || lookup("prefix") != Some(encoded_prefix.as_str())
+    {
+        return false;
+    }
+    continuation_token.map_or_else(
+        || lookup("continuation-token").is_none(),
+        |token| {
+            let mut encoded = String::new();
+            push_encoded_query_value(&mut encoded, token);
+            lookup("continuation-token") == Some(encoded.as_str())
+        },
+    )
 }
 
 fn valid_port(port: &str) -> bool {
@@ -285,6 +417,58 @@ pub fn build_head_request(
         presigned_authority,
         None,
     )
+}
+
+#[inline(never)]
+pub fn build_list_request(
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+    presigned_query: Option<&str>,
+    presigned_authority: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    if !valid_endpoint(endpoint) {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "invalid S3 list endpoint",
+        ));
+    }
+    if presigned_authority.is_some_and(|authority| !valid_presigned_authority(authority))
+        || presigned_authority.is_some() != presigned_query.is_some()
+    {
+        return Err(HttpError::new(
+            HttpErrorKind::InvalidRequest,
+            "invalid presigned list authority",
+        ));
+    }
+    let canonical_query = build_list_query(prefix, max_keys, continuation_token)?;
+    let query = if let Some(query) = presigned_query {
+        if !presigned_list_query_matches(query, prefix, max_keys, continuation_token) {
+            return Err(HttpError::new(
+                HttpErrorKind::InvalidRequest,
+                "presigned query does not match S3 list options",
+            ));
+        }
+        query
+    } else {
+        &canonical_query
+    };
+    let target = build_list_canonical_uri(bucket)?;
+    let authority = presigned_authority.unwrap_or(endpoint);
+    let mut request = String::with_capacity(target.len() + query.len() + authority.len() + 96);
+    write!(
+        request,
+        "GET {target}?{query} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|_error| {
+        HttpError::new(
+            HttpErrorKind::Limit,
+            "S3 list request construction exceeded a fixed limit",
+        )
+    })?;
+    Ok(request.into_bytes())
 }
 
 fn header_end(raw: &[u8]) -> Result<usize, HttpError> {
@@ -989,6 +1173,103 @@ mod tests {
         );
         assert!(!request.contains("Host: operator-route"));
         assert!(!request.contains("GET "));
+    }
+
+    #[test]
+    fn list_query_is_canonical_bounded_and_caller_driven() {
+        assert_eq!(
+            build_list_query("exports/space %/é+", 17, None).expect("first page"),
+            "list-type=2&max-keys=17&prefix=exports%2Fspace%20%25%2F%C3%A9%2B"
+        );
+        assert_eq!(
+            build_list_query("exports/", 17, Some("opaque/next+2")).expect("later page"),
+            "continuation-token=opaque%2Fnext%2B2&list-type=2&max-keys=17&prefix=exports%2F"
+        );
+        for (prefix, max_keys, token) in [
+            ("", 1, None),
+            ("exports/", 0, None),
+            ("exports/", MAX_LIST_KEYS + 1, None),
+            ("exports/", 1, Some("")),
+        ] {
+            assert!(build_list_query(prefix, max_keys, token).is_err());
+        }
+    }
+
+    #[test]
+    fn deterministic_list_query_corpus_is_ascii_and_canonical() {
+        for byte in 0_u8..=127 {
+            let character = char::from(byte);
+            let prefix = format!("exports/{character}suffix");
+            let token = format!("opaque{character}token");
+            let query = build_list_query(&prefix, 1000, Some(&token)).expect("bounded query");
+            assert!(query.is_ascii());
+            assert!(!query.contains(' '));
+            for (index, encoded) in query.bytes().enumerate() {
+                if encoded == b'%' {
+                    let escape = query
+                        .as_bytes()
+                        .get(index + 1..index + 3)
+                        .expect("complete percent escape");
+                    assert!(escape.iter().all(u8::is_ascii_hexdigit));
+                    assert!(!escape.iter().any(u8::is_ascii_lowercase));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_and_presigned_list_requests_bind_the_exact_options() {
+        let anonymous = build_list_request(
+            "object-store",
+            "results",
+            "exports/",
+            2,
+            Some("next/+"),
+            None,
+            None,
+        )
+        .expect("anonymous list");
+        assert_eq!(
+            String::from_utf8(anonymous).expect("ASCII"),
+            "GET /results/?continuation-token=next%2F%2B&list-type=2&max-keys=2&prefix=exports%2F HTTP/1.1\r\nHost: object-store\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        );
+
+        let presigned_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc%2Fdef&list-type=2&max-keys=2&prefix=exports%2F";
+        let presigned = build_list_request(
+            "operator-route",
+            "results",
+            "exports/",
+            2,
+            None,
+            Some(presigned_query),
+            Some("127.0.0.1:9000"),
+        )
+        .expect("presigned list");
+        let presigned = String::from_utf8(presigned).expect("ASCII");
+        assert!(presigned.starts_with(&format!("GET /results/?{presigned_query} HTTP/1.1\r\n")));
+        assert!(presigned.contains("\r\nHost: 127.0.0.1:9000\r\n"));
+
+        for mismatch in [
+            "X-Amz-Signature=x&list-type=1&max-keys=2&prefix=exports%2F",
+            "X-Amz-Signature=x&list-type=2&max-keys=3&prefix=exports%2F",
+            "X-Amz-Signature=x&list-type=2&max-keys=2&prefix=other%2F",
+            "X-Amz-Signature=x&list-type=2&list-type=2&max-keys=2&prefix=exports%2F",
+            "X-Amz-Signature=x&list-type=2&max-keys=2&prefix=exports%2F&continuation-token=unexpected",
+        ] {
+            assert!(
+                build_list_request(
+                    "operator-route",
+                    "results",
+                    "exports/",
+                    2,
+                    None,
+                    Some(mismatch),
+                    Some("127.0.0.1:9000")
+                )
+                .is_err(),
+                "accepted mismatch: {mismatch}"
+            );
+        }
     }
 
     #[test]
