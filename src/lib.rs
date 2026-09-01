@@ -10,11 +10,13 @@ mod bindings {
 }
 
 mod http;
+mod list;
 
 use bindings::exports::sigil::s3::client::{
-    Auth, Error, ErrorClass, Guest, HeadOptions, ObjectMetadata, ObjectOptions,
+    Auth, Error, ErrorClass, Guest, HeadOptions, ListOptions, ListPage, ListedObject,
+    ObjectMetadata, ObjectOptions,
 };
-use bindings::sigil::{host1_0_0::net, host1_1_0::sigv4};
+use bindings::sigil::{host1_0_0::net, host1_2_0::sigv4};
 use http::{HttpError, HttpErrorKind};
 
 const HOST_READ_BYTES: u32 = 1024 * 1024;
@@ -228,6 +230,40 @@ fn build_sigv4_head_request(
     })
 }
 
+fn build_sigv4_list_request(
+    signing_grant: &str,
+    bucket: &str,
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> Result<sigv4::Request, Error> {
+    if !valid_signing_grant(signing_grant) {
+        return Err(Error {
+            class: ErrorClass::InvalidRequest,
+            status: None,
+            message: "invalid SigV4 signing grant".to_owned(),
+        });
+    }
+    let canonical_uri =
+        http::build_list_canonical_uri(bucket).map_err(|error| client_error(&error))?;
+    let canonical_query = http::build_list_query(prefix, max_keys, continuation_token)
+        .map_err(|error| client_error(&error))?;
+    let max_response_bytes =
+        u64::try_from(wire_limit(list::MAX_LIST_BODY_BYTES)?).map_err(|_error| Error {
+            class: ErrorClass::Limit,
+            status: None,
+            message: "S3 list response byte limit is not representable".to_owned(),
+        })?;
+    Ok(sigv4::Request {
+        signing_grant: signing_grant.to_owned(),
+        method: sigv4::Method::Get,
+        canonical_uri,
+        canonical_query,
+        headers: Vec::new(),
+        max_response_bytes,
+    })
+}
+
 fn raw_head_object(
     endpoint: &str,
     bucket: &str,
@@ -339,6 +375,142 @@ fn signed_get_object(
     result
 }
 
+fn convert_list_page(page: list::ParsedListPage) -> ListPage {
+    ListPage {
+        objects: page
+            .objects
+            .into_iter()
+            .map(|object| ListedObject {
+                key: object.key,
+                size: object.size,
+                etag: object.etag,
+                last_modified: object.last_modified,
+            })
+            .collect(),
+        is_truncated: page.is_truncated,
+        next_continuation_token: page.next_continuation_token,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_list_objects(
+    endpoint: &str,
+    bucket: &str,
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+    query: Option<&str>,
+    authority: Option<&str>,
+) -> Result<ListPage, Error> {
+    let request = http::build_list_request(
+        endpoint,
+        bucket,
+        prefix,
+        max_keys,
+        continuation_token,
+        query,
+        authority,
+    )
+    .map_err(|error| client_error(&error))?;
+    let wire_limit = wire_limit(list::MAX_LIST_BODY_BYTES)?;
+    let stream = net::connect(endpoint).map_err(net_error)?;
+    let result = (|| {
+        stream.write_all(&request).map_err(net_error)?;
+        stream.flush().map_err(net_error)?;
+        let mut raw = Vec::new();
+        loop {
+            let remaining = wire_limit.saturating_sub(raw.len());
+            if remaining == 0 {
+                return Err(Error {
+                    class: ErrorClass::Limit,
+                    status: None,
+                    message: "S3 list response exceeds the wire byte limit".to_owned(),
+                });
+            }
+            let Some(useful) = http::next_read_size(&raw, list::MAX_LIST_BODY_BYTES)
+                .map_err(|error| client_error(&error))?
+            else {
+                break;
+            };
+            let requested = u32::try_from(remaining.min(useful))
+                .unwrap_or(u32::MAX)
+                .min(HOST_READ_BYTES);
+            let chunk = stream.read(requested).map_err(net_error)?;
+            if chunk.is_empty() {
+                break;
+            }
+            raw.extend_from_slice(&chunk);
+            if raw.len() > wire_limit {
+                return Err(Error {
+                    class: ErrorClass::Limit,
+                    status: None,
+                    message: "S3 list response exceeds the wire byte limit".to_owned(),
+                });
+            }
+        }
+        let body = http::decode_response(&raw, list::MAX_LIST_BODY_BYTES)
+            .map_err(|error| client_error(&error))?;
+        list::parse_list_page(&body, bucket, prefix, max_keys, continuation_token)
+            .map(convert_list_page)
+            .map_err(|error| client_error(&error))
+    })();
+    stream.close();
+    result
+}
+
+fn signed_list_objects(
+    signing_grant: &str,
+    bucket: &str,
+    prefix: &str,
+    max_keys: u32,
+    continuation_token: Option<&str>,
+) -> Result<ListPage, Error> {
+    let request =
+        build_sigv4_list_request(signing_grant, bucket, prefix, max_keys, continuation_token)?;
+    let wire_limit = wire_limit(list::MAX_LIST_BODY_BYTES)?;
+    let response = sigv4::exchange(&request).map_err(sigv4_error)?;
+    let result = (|| {
+        let mut raw = Vec::new();
+        loop {
+            let remaining = wire_limit.saturating_sub(raw.len());
+            if remaining == 0 {
+                return Err(Error {
+                    class: ErrorClass::Limit,
+                    status: None,
+                    message: "S3 list response exceeds the wire byte limit".to_owned(),
+                });
+            }
+            let Some(useful) = http::next_signed_read_size(&raw, list::MAX_LIST_BODY_BYTES)
+                .map_err(|error| client_error(&error))?
+            else {
+                break;
+            };
+            let requested = u32::try_from(remaining.min(useful))
+                .unwrap_or(u32::MAX)
+                .min(HOST_READ_BYTES);
+            let chunk = response.read(requested).map_err(sigv4_error)?;
+            if chunk.is_empty() {
+                break;
+            }
+            raw.extend_from_slice(&chunk);
+            if raw.len() > wire_limit {
+                return Err(Error {
+                    class: ErrorClass::Limit,
+                    status: None,
+                    message: "S3 list response exceeds the wire byte limit".to_owned(),
+                });
+            }
+        }
+        let body = http::decode_signed_response(&raw, list::MAX_LIST_BODY_BYTES)
+            .map_err(|error| client_error(&error))?;
+        list::parse_list_page(&body, bucket, prefix, max_keys, continuation_token)
+            .map(convert_list_page)
+            .map_err(|error| client_error(&error))
+    })();
+    response.close();
+    result
+}
+
 #[inline(never)]
 fn get_object(options: &ObjectOptions) -> Result<Vec<u8>, Error> {
     let max_bytes = object_limit(options.max_bytes)?;
@@ -384,6 +556,37 @@ fn head_object(options: &HeadOptions) -> Result<ObjectMetadata, Error> {
     }
 }
 
+#[inline(never)]
+fn list_objects(options: &ListOptions) -> Result<ListPage, Error> {
+    match &options.auth {
+        Auth::Anonymous(auth) => raw_list_objects(
+            &auth.endpoint,
+            &options.bucket,
+            &options.prefix,
+            options.max_keys,
+            options.continuation_token.as_deref(),
+            None,
+            None,
+        ),
+        Auth::Presigned(auth) => raw_list_objects(
+            &auth.endpoint,
+            &options.bucket,
+            &options.prefix,
+            options.max_keys,
+            options.continuation_token.as_deref(),
+            Some(&auth.query),
+            Some(&auth.authority),
+        ),
+        Auth::Sigv4(signing_grant) => signed_list_objects(
+            signing_grant,
+            &options.bucket,
+            &options.prefix,
+            options.max_keys,
+            options.continuation_token.as_deref(),
+        ),
+    }
+}
+
 impl Guest for S3 {
     fn get_object(options: ObjectOptions) -> Result<Vec<u8>, Error> {
         get_object(&options)
@@ -391,6 +594,10 @@ impl Guest for S3 {
 
     fn head_object(options: HeadOptions) -> Result<ObjectMetadata, Error> {
         head_object(&options)
+    }
+
+    fn list_objects(options: ListOptions) -> Result<ListPage, Error> {
+        list_objects(&options)
     }
 }
 
@@ -504,6 +711,40 @@ mod tests {
             u64::try_from(wire_limit(4 * 1024 * 1024).expect("GET wire bound"))
                 .expect("u64 GET wire bound")
         );
+    }
+
+    #[test]
+    fn sigv4_list_is_one_bounded_canonical_page() {
+        let first =
+            build_sigv4_list_request("private-list", "results", "exports/space %/é+", 3, None)
+                .expect("first page");
+        assert_eq!(first.signing_grant, "private-list");
+        assert_eq!(first.method, sigv4::Method::Get);
+        assert_eq!(first.canonical_uri, "/results/");
+        assert_eq!(
+            first.canonical_query,
+            "list-type=2&max-keys=3&prefix=exports%2Fspace%20%25%2F%C3%A9%2B"
+        );
+        assert!(first.headers.is_empty());
+        assert_eq!(
+            first.max_response_bytes,
+            u64::try_from(list::MAX_LIST_BODY_BYTES + http::MAX_WIRE_OVERHEAD_BYTES)
+                .expect("fixed bound")
+        );
+
+        let later = build_sigv4_list_request(
+            "private-list",
+            "results",
+            "exports/",
+            3,
+            Some("opaque/next+2"),
+        )
+        .expect("later page");
+        assert_eq!(
+            later.canonical_query,
+            "continuation-token=opaque%2Fnext%2B2&list-type=2&max-keys=3&prefix=exports%2F"
+        );
+        assert_eq!(first.max_response_bytes, later.max_response_bytes);
     }
 
     #[test]

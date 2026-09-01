@@ -1,6 +1,6 @@
 # Pinned S3 HEAD acceptance
 
-This gate proves the unpublished S3 0.2 component through Sigil's real plugin
+This gate proves the unpublished S3 0.3 component through Sigil's real plugin
 store, lock, generated Lua types, component host, raw network route, and opaque
 SigV4 host signer. It publishes nothing.
 
@@ -30,3 +30,24 @@ and verifies removal in its exit trap. Ignored evidence is retained under
 `target/live-head/run.*`, including the generated `wasm.s3` Lua stub, exact
 image and candidate identities, direct response headers, the JSON scenario
 report, and teardown status.
+
+## Pinned S3 LIST acceptance
+
+`just live-list` is the unpublished 0.3 listing gate. It uses the same pinned
+images and drives the exact local component through Sigil's store, lock,
+generated Lua types, raw network route, and Host API 1.2 signer. Independent
+HTTP listings establish the expected server order, unsigned sizes, ETags, and
+Last-Modified text for keys containing spaces, Unicode, and percent text.
+
+The scenario proves an anonymous page, a separately presigned page, and a
+private SigV4 first page followed by exactly one explicit call with the opaque
+continuation token. It also proves prefix isolation, wrong-credential denial,
+signed missing-bucket classification, missing-secret fail-closed behavior,
+undeclared-route confinement, and an export surface with no object-store
+mutation. Ignored evidence is retained under `target/live-list/run.*`.
+
+```sh
+SIGIL=/home/bob/src/sigil/target/debug/sigil \
+SIGIL_CHECKOUT=/home/bob/src/sigil \
+just live-list
+```

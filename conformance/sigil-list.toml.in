@@ -1,0 +1,107 @@
+[deploy]
+backend = "external"
+
+[plugins]
+allow_third_party = true
+
+[plugins.trust]
+install_allowlist = ["github:conformance/s3"]
+
+[plugins.trust.capability_allowlist]
+network = ["github:conformance/s3"]
+sigv4 = ["github:conformance/s3"]
+
+[plugins.require]
+s3 = { version = "=0.3.0-rc.1", source = "github:conformance/s3" }
+
+[plugins.grants.s3.network.object-store]
+target = "object-store:9000"
+tls = "disabled"
+connect_timeout = "5s"
+io_timeout = "5s"
+max_connections = 8
+max_bytes = "5MiB"
+
+[plugins.grants.s3.sigv4.private-list]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_SECRET_KEY"
+region = "us-east-1"
+service = "s3"
+authority = "@AUTHORITY@"
+methods = ["GET"]
+canonical_uri_prefixes = ["/private-results/"]
+header_names = []
+
+[plugins.grants.s3.sigv4.private-list.query.list-type]
+required = true
+exact_values = ["2"]
+
+[plugins.grants.s3.sigv4.private-list.query.max-keys]
+required = true
+decimal_max = 1000
+
+[plugins.grants.s3.sigv4.private-list.query.prefix]
+required = true
+encoded_prefixes = ["exports%2F"]
+
+[plugins.grants.s3.sigv4.private-list.query.continuation-token]
+required = false
+opaque_max_encoded_bytes = 6144
+
+[plugins.grants.s3.sigv4.wrong-private-list]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_WRONG_SECRET"
+region = "us-east-1"
+service = "s3"
+authority = "@AUTHORITY@"
+methods = ["GET"]
+canonical_uri_prefixes = ["/private-results/"]
+header_names = []
+
+[plugins.grants.s3.sigv4.wrong-private-list.query.list-type]
+required = true
+exact_values = ["2"]
+
+[plugins.grants.s3.sigv4.wrong-private-list.query.max-keys]
+required = true
+decimal_max = 1000
+
+[plugins.grants.s3.sigv4.wrong-private-list.query.prefix]
+required = true
+encoded_prefixes = ["exports%2F"]
+
+[plugins.grants.s3.sigv4.wrong-private-list.query.continuation-token]
+required = false
+opaque_max_encoded_bytes = 6144
+
+[plugins.grants.s3.sigv4.missing-list]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_SECRET_KEY"
+region = "us-east-1"
+service = "s3"
+authority = "@AUTHORITY@"
+methods = ["GET"]
+canonical_uri_prefixes = ["/missing-results/"]
+header_names = []
+
+[plugins.grants.s3.sigv4.missing-list.query.list-type]
+required = true
+exact_values = ["2"]
+
+[plugins.grants.s3.sigv4.missing-list.query.max-keys]
+required = true
+decimal_max = 1000
+
+[plugins.grants.s3.sigv4.missing-list.query.prefix]
+required = true
+encoded_prefixes = ["exports%2F"]
+
+[plugins.grants.s3.sigv4.missing-list.query.continuation-token]
+required = false
+opaque_max_encoded_bytes = 6144
+
+[plugins.runtime]
+max_call_seconds = 10

@@ -22,7 +22,7 @@ elif command -v podman >/dev/null 2>&1; then
 elif command -v docker >/dev/null 2>&1; then
   ENGINE=docker
 else
-  echo "Podman or Docker is required for live HEAD acceptance" >&2
+  echo "Podman or Docker is required for live LIST acceptance" >&2
   exit 2
 fi
 readonly ENGINE
@@ -31,9 +31,9 @@ MINIO_IMAGE="quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec8
 MC_IMAGE="quay.io/minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
 readonly MINIO_IMAGE MC_IMAGE
 
-MINIO_USER="sigilheadaccess"
-MINIO_PASSWORD="sigil-head-secret-2026"
-WRONG_PASSWORD="definitely-wrong-secret"
+MINIO_USER="sigillistaccess"
+MINIO_PASSWORD="sigil-list-secret-2026"
+WRONG_PASSWORD="definitely-wrong-list-secret"
 readonly MINIO_USER MINIO_PASSWORD WRONG_PASSWORD
 MINIO_ROOT_USER="$MINIO_USER"
 MINIO_ROOT_PASSWORD="$MINIO_PASSWORD"
@@ -43,10 +43,10 @@ PRESIGN_SECRET_KEY="$MINIO_PASSWORD"
 export MINIO_ROOT_USER MINIO_ROOT_PASSWORD MC_HOST_live
 export PRESIGN_ACCESS_KEY PRESIGN_SECRET_KEY
 
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/sigil-s3-head.XXXXXXXX")"
-mkdir -p "$ROOT/target/live-head"
-EVIDENCE="$(mktemp -d "$ROOT/target/live-head/run.XXXXXXXX")"
-container="sigil-s3-head-$$"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/sigil-s3-list.XXXXXXXX")"
+mkdir -p "$ROOT/target/live-list"
+EVIDENCE="$(mktemp -d "$ROOT/target/live-list/run.XXXXXXXX")"
+container="sigil-s3-list-$$"
 readonly SCRATCH EVIDENCE container
 
 cleanup() {
@@ -116,10 +116,10 @@ curl --proto '=http' --silent --show-error --fail \
   "$base_url/minio/health/ready" >/dev/null
 
 mkdir -p "$SCRATCH/fixtures"
-: >"$SCRATCH/fixtures/zero.bin"
-printf 'PAR1\000sigil-head-nonzero\377' >"$SCRATCH/fixtures/nonzero.bin"
-NONZERO_SIZE="$(wc -c <"$SCRATCH/fixtures/nonzero.bin" | tr -d ' ')"
-export NONZERO_SIZE
+printf 'alpha\n' >"$SCRATCH/fixtures/alpha.bin"
+printf 'space payload\000tail' >"$SCRATCH/fixtures/space.bin"
+printf 'unicode percent payload \377\000' >"$SCRATCH/fixtures/unicode.bin"
+printf 'must not appear' >"$SCRATCH/fixtures/outside.bin"
 
 "$ENGINE" run --rm --network "container:$container" \
   --entrypoint /bin/sh \
@@ -128,59 +128,82 @@ export NONZERO_SIZE
   "$MC_IMAGE" -c '
     set -eu
     mc mb live/public-results live/private-results >/dev/null
-    mc cp /fixtures/zero.bin live/public-results/zero.bin >/dev/null
-    mc cp /fixtures/nonzero.bin live/public-results/nonzero.bin >/dev/null
-    mc cp /fixtures/nonzero.bin live/private-results/nonzero.bin >/dev/null
+    for bucket in public-results private-results; do
+      mc cp /fixtures/alpha.bin "live/$bucket/exports/alpha.txt" >/dev/null
+      mc cp /fixtures/space.bin "live/$bucket/exports/space name.txt" >/dev/null
+      mc cp /fixtures/unicode.bin "live/$bucket/exports/unicode-é%25.bin" >/dev/null
+      mc cp /fixtures/outside.bin "live/$bucket/outside/ignored.txt" >/dev/null
+    done
     mc anonymous set download live/public-results >/dev/null
   ' >"$EVIDENCE/mc.setup.txt"
 
-PRESIGNED_HEAD_QUERY="$(python3 "$ROOT/scripts/presign-head.py" \
+PRESIGNED_LIST_QUERY="$(python3 "$ROOT/scripts/presign-list.py" \
   --authority "$authority" \
   --bucket private-results \
-  --key nonzero.bin)"
+  --prefix exports/ \
+  --max-keys 100)"
 PRESIGNED_AUTHORITY="$authority"
-export PRESIGNED_HEAD_QUERY PRESIGNED_AUTHORITY
+export PRESIGNED_LIST_QUERY PRESIGNED_AUTHORITY
 
-curl --proto '=http' --silent --show-error --fail --head \
-  "$base_url/public-results/zero.bin" >"$EVIDENCE/zero.headers"
-curl --proto '=http' --silent --show-error --fail --head \
-  "$base_url/public-results/nonzero.bin" >"$EVIDENCE/nonzero.headers"
-curl --proto '=http' --silent --show-error --fail --head \
-  "$base_url/private-results/nonzero.bin?$PRESIGNED_HEAD_QUERY" \
-  >"$EVIDENCE/private-presigned.headers"
+curl --proto '=http' --silent --show-error --fail \
+  "$base_url/public-results?list-type=2&max-keys=100&prefix=exports%2F" \
+  >"$EVIDENCE/public-list.xml"
+curl --proto '=http' --silent --show-error --fail \
+  "$base_url/private-results/?$PRESIGNED_LIST_QUERY" \
+  >"$EVIDENCE/private-list.xml"
 
-header_value() {
-  python3 - "$1" "$2" <<'PY'
+python3 - "$EVIDENCE/public-list.xml" "$EVIDENCE/private-list.xml" \
+  "$SCRATCH/expected.env" <<'PY'
 from pathlib import Path
+import shlex
 import sys
+import xml.etree.ElementTree as ET
 
-path = Path(sys.argv[1])
-name = sys.argv[2].encode("ascii").lower()
-values = []
-for line in path.read_bytes().split(b"\r\n"):
-    if b":" not in line:
-        continue
-    field, value = line.split(b":", maxsplit=1)
-    if field.lower() == name:
-        values.append(value.strip(b" \t").decode("ascii"))
-if len(values) != 1:
-    raise SystemExit(f"expected exactly one {name!r} in {path}: {values!r}")
-print(values[0])
+
+def local(element: ET.Element, name: str) -> str | None:
+    child = element.find(f"{{*}}{name}")
+    return None if child is None else child.text
+
+
+def read(path: str) -> list[dict[str, str]]:
+    root = ET.fromstring(Path(path).read_bytes())
+    values = []
+    for item in root.findall("{*}Contents"):
+        values.append(
+            {
+                "key": local(item, "Key") or "",
+                "size": local(item, "Size") or "",
+                "etag": local(item, "ETag") or "",
+                "last_modified": local(item, "LastModified") or "",
+            }
+        )
+    return values
+
+
+expected_keys = [
+    "exports/alpha.txt",
+    "exports/space name.txt",
+    "exports/unicode-é%25.bin",
+]
+lines = []
+for label, path in (("PUBLIC", sys.argv[1]), ("PRIVATE", sys.argv[2])):
+    objects = read(path)
+    if [item["key"] for item in objects] != expected_keys:
+        raise SystemExit(f"independent {label} listing differs: {objects!r}")
+    for name, item in zip(("ALPHA", "SPACE", "UNICODE"), objects, strict=True):
+        if not item["size"].isdigit() or not item["etag"] or not item["last_modified"]:
+            raise SystemExit(f"independent {label} metadata is incomplete: {item!r}")
+        for field in ("size", "etag", "last_modified"):
+            variable = f"{label}_{name}_{field.upper()}"
+            lines.append(f"export {variable}={shlex.quote(item[field])}")
+Path(sys.argv[3]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
-}
-
-ZERO_ETAG="$(header_value "$EVIDENCE/zero.headers" etag)"
-ZERO_LAST_MODIFIED="$(header_value "$EVIDENCE/zero.headers" last-modified)"
-NONZERO_ETAG="$(header_value "$EVIDENCE/nonzero.headers" etag)"
-NONZERO_LAST_MODIFIED="$(header_value "$EVIDENCE/nonzero.headers" last-modified)"
-PRIVATE_ETAG="$(header_value "$EVIDENCE/private-presigned.headers" etag)"
-PRIVATE_LAST_MODIFIED="$(header_value "$EVIDENCE/private-presigned.headers" last-modified)"
-export ZERO_ETAG ZERO_LAST_MODIFIED NONZERO_ETAG NONZERO_LAST_MODIFIED
-export PRIVATE_ETAG PRIVATE_LAST_MODIFIED
+# shellcheck source=/dev/null
+source "$SCRATCH/expected.env"
 
 mkdir -p "$SCRATCH/package/dist" "$SCRATCH/seeder/src" \
   "$SCRATCH/project/.sigil" "$SCRATCH/project/scenarios" \
-  "$SCRATCH/data" "$SCRATCH/cache"
+  "$SCRATCH/project/probes" "$SCRATCH/data" "$SCRATCH/cache"
 cp "$ROOT/plugin.toml" "$SCRATCH/package/plugin.toml"
 cp "$ROOT/plugin.wasm" "$SCRATCH/package/plugin.wasm"
 python3 - "$SCRATCH/package/plugin.toml" <<'PY'
@@ -200,6 +223,21 @@ PY
 "$SIGIL" plugin pack "$SCRATCH/package/plugin.toml" \
   --output-dir "$SCRATCH/package/dist" >/dev/null
 
+python3 - "$EVIDENCE/plugin.inspect.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+inspect = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+serialized = json.dumps(inspect, sort_keys=True)
+for required in ("get-object", "head-object", "list-objects"):
+    if required not in serialized:
+        raise SystemExit(f"candidate inspection omitted {required}")
+for forbidden in ("put-object", "delete-object", "create-bucket", "delete-bucket"):
+    if forbidden in serialized:
+        raise SystemExit(f"candidate exposes mutation: {forbidden}")
+PY
+
 cp "$ROOT/tools/sigil-compat-seed/Cargo.toml.in" "$SCRATCH/seeder/Cargo.toml"
 python3 - "$SCRATCH/seeder/Cargo.toml" "$SIGIL_CHECKOUT" <<'PY'
 from pathlib import Path
@@ -216,9 +254,10 @@ CARGO_TARGET_DIR="$ROOT/target/sigil-compat-seed" \
   cargo run --quiet --locked --offline --manifest-path "$SCRATCH/seeder/Cargo.toml" -- \
   "$SCRATCH/data" \
   "$SCRATCH/package/dist/s3-0.3.0-rc.1.sigil-plugin.tar.zst" \
-  github:conformance/s3 s3 0.3.0-rc.1 s3-head-live-0.3.0-rc.1
+  github:conformance/s3 s3 0.3.0-rc.1 s3-list-live-0.3.0-rc.1
 
-python3 - "$ROOT/conformance/sigil.toml.in" "$SCRATCH/project/.sigil/sigil.toml" "$authority" <<'PY'
+python3 - "$ROOT/conformance/sigil-list.toml.in" \
+  "$SCRATCH/project/.sigil/sigil.toml" "$authority" <<'PY'
 from pathlib import Path
 import sys
 
@@ -226,11 +265,12 @@ source = Path(sys.argv[1])
 destination = Path(sys.argv[2])
 authority = sys.argv[3]
 text = source.read_text(encoding="utf-8")
-if text.count("@AUTHORITY@") != 2:
+if text.count("@AUTHORITY@") != 3:
     raise SystemExit("SigV4 authority template count differs")
 destination.write_text(text.replace("@AUTHORITY@", authority), encoding="utf-8")
 PY
-cp "$ROOT/conformance/head.sigil.lua" "$SCRATCH/project/scenarios/head.lua"
+cp "$ROOT/conformance/list.sigil.lua" "$SCRATCH/project/scenarios/list.lua"
+cp "$ROOT/conformance/list-route-denied.sigil.lua" "$SCRATCH/project/probes/route.lua"
 
 run_sigil() {
   (
@@ -243,28 +283,35 @@ run_sigil() {
 run_sigil plugin lock >"$EVIDENCE/plugin.lock.txt"
 run_sigil generate-types >"$EVIDENCE/generate-types.txt"
 cp "$SCRATCH/project/.sigil/types/wasm/s3.lua" "$EVIDENCE/s3.lua"
-grep -F 'head-object' "$EVIDENCE/s3.lua" >/dev/null
-grep -F 'content-length' "$EVIDENCE/s3.lua" >/dev/null
-grep -F 'last-modified' "$EVIDENCE/s3.lua" >/dev/null
+grep -F 'list-objects' "$EVIDENCE/s3.lua" >/dev/null
+grep -F 'is-truncated' "$EVIDENCE/s3.lua" >/dev/null
+grep -F 'next-continuation-token' "$EVIDENCE/s3.lua" >/dev/null
 
 OBJECT_STORE_ACCESS_KEY="$MINIO_USER"
 OBJECT_STORE_SECRET_KEY="$MINIO_PASSWORD"
 OBJECT_STORE_WRONG_SECRET="$WRONG_PASSWORD"
 export OBJECT_STORE_ACCESS_KEY OBJECT_STORE_SECRET_KEY OBJECT_STORE_WRONG_SECRET
+
+env_names=(
+  PUBLIC_ALPHA_SIZE PUBLIC_ALPHA_ETAG PUBLIC_ALPHA_LAST_MODIFIED
+  PUBLIC_SPACE_SIZE PUBLIC_SPACE_ETAG PUBLIC_SPACE_LAST_MODIFIED
+  PUBLIC_UNICODE_SIZE PUBLIC_UNICODE_ETAG PUBLIC_UNICODE_LAST_MODIFIED
+  PRIVATE_ALPHA_SIZE PRIVATE_ALPHA_ETAG PRIVATE_ALPHA_LAST_MODIFIED
+  PRIVATE_SPACE_SIZE PRIVATE_SPACE_ETAG PRIVATE_SPACE_LAST_MODIFIED
+  PRIVATE_UNICODE_SIZE PRIVATE_UNICODE_ETAG PRIVATE_UNICODE_LAST_MODIFIED
+  PRESIGNED_LIST_QUERY PRESIGNED_AUTHORITY
+)
+env_args=()
+for name in "${env_names[@]}"; do
+  env_args+=(--env "$name")
+done
+
 run_sigil run scenarios \
   --endpoint "object-store=$base_url" \
   --env OBJECT_STORE_ACCESS_KEY \
   --env OBJECT_STORE_SECRET_KEY \
   --env OBJECT_STORE_WRONG_SECRET \
-  --env ZERO_ETAG \
-  --env ZERO_LAST_MODIFIED \
-  --env NONZERO_SIZE \
-  --env NONZERO_ETAG \
-  --env NONZERO_LAST_MODIFIED \
-  --env PRIVATE_ETAG \
-  --env PRIVATE_LAST_MODIFIED \
-  --env PRESIGNED_HEAD_QUERY \
-  --env PRESIGNED_AUTHORITY \
+  "${env_args[@]}" \
   --json >"$EVIDENCE/report.json"
 
 python3 - "$EVIDENCE/report.json" <<'PY'
@@ -281,26 +328,68 @@ if not (
     and report.get("failed") == 0
     and len(report.get("scenarios", [])) == 1
 ):
-    raise SystemExit("live HEAD report summary differs")
+    raise SystemExit("live LIST report summary differs")
 scenario = report["scenarios"][0]
 expects = scenario.get("expects", [])
-if scenario.get("status") != "passed" or len(expects) != 29:
-    raise SystemExit("live HEAD scenario or assertion count differs")
+if scenario.get("status") != "passed" or len(expects) != 68:
+    raise SystemExit(f"live LIST scenario or assertion count differs: {len(expects)}")
 if not all(expect.get("passed") is True for expect in expects):
-    raise SystemExit("live HEAD report contains a failed assertion")
+    raise SystemExit("live LIST report contains a failed assertion")
 for forbidden in (
-    "sigil-head-secret-2026",
-    "definitely-wrong-secret",
+    "sigil-list-secret-2026",
+    "definitely-wrong-list-secret",
     "X-Amz-Signature=",
 ):
     if forbidden in serialized:
         raise SystemExit(f"live report exposed secret material: {forbidden}")
 PY
 
+if run_sigil run probes/route.lua \
+  --endpoint "object-store=$base_url" \
+  --env OBJECT_STORE_ACCESS_KEY \
+  --env OBJECT_STORE_SECRET_KEY \
+  --env OBJECT_STORE_WRONG_SECRET \
+  --json >"$EVIDENCE/route-denied.json"; then
+  echo "undeclared route unexpectedly passed" >&2
+  exit 1
+fi
+
+if run_sigil run scenarios \
+  --endpoint "object-store=$base_url" \
+  --env OBJECT_STORE_ACCESS_KEY \
+  --env OBJECT_STORE_WRONG_SECRET \
+  "${env_args[@]}" \
+  --json >"$EVIDENCE/missing-secret.json"; then
+  echo "missing secret unexpectedly passed" >&2
+  exit 1
+fi
+
+python3 - "$EVIDENCE/route-denied.json" "$EVIDENCE/missing-secret.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+expected = ("PLUGIN_NETWORK_DENIED", "PLUGIN_SECRET_DENIED")
+for path, code in zip(sys.argv[1:], expected, strict=True):
+    report = json.loads(Path(path).read_text(encoding="utf-8"))
+    scenarios = report.get("scenarios", [])
+    if len(scenarios) != 1:
+        raise SystemExit(f"negative report has the wrong scenario count: {path}")
+    scenario = scenarios[0]
+    failure = scenario.get("plugin_failure", {})
+    if (
+        report.get("status") != "failed"
+        or scenario.get("failure_class") != "plugin_infrastructure"
+        or failure.get("code") != code
+    ):
+        raise SystemExit(f"negative report differs for {code}: {scenario!r}")
+PY
+
 printf '%s\n' \
-  "candidate_commit=$(git rev-parse HEAD)" \
-  "component_sha256=$(sha256sum plugin.wasm | cut -d' ' -f1)" \
-  "component_blake3=$(b3sum plugin.wasm | cut -d' ' -f1)" \
+  "candidate_commit=$(git -C "$ROOT" rev-parse HEAD)" \
+  "candidate_status=$(git -C "$ROOT" status --short | wc -l | tr -d ' ') paths" \
+  "component_sha256=$(sha256sum "$ROOT/plugin.wasm" | cut -d' ' -f1)" \
+  "component_blake3=$(b3sum "$ROOT/plugin.wasm" | cut -d' ' -f1)" \
   "package_sha256=$(sha256sum "$archive" | cut -d' ' -f1)" \
   "package_blake3=$(b3sum "$archive" | cut -d' ' -f1)" \
   "minio_image=$MINIO_IMAGE" \
@@ -310,7 +399,6 @@ printf '%s\n' \
   "sigil_commit=$(git -C "$SIGIL_CHECKOUT" rev-parse HEAD)" \
   "sigil_binary_sha256=$(sha256sum "$SIGIL" | cut -d' ' -f1)" \
   "authority=$authority" \
-  "nonzero_size=$NONZERO_SIZE" \
   >"$EVIDENCE/identities.txt"
 
-echo "pinned MinIO HEAD acceptance passed"
+echo "pinned MinIO LIST acceptance passed"

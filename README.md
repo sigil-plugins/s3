@@ -1,12 +1,14 @@
 # Sigil S3 plugin
 
 `wasm.s3` is a bounded, read-only S3-compatible object client for Sigil
-scenarios. Version 0.2 performs one path-style HTTP `GET` or `HEAD`. GET
+scenarios. Version 0.3 performs one path-style HTTP `GET`, `HEAD`, or bounded
+ListObjectsV2 page. GET
 returns the exact object bytes as a binary Lua string; HEAD returns optional
 size, ETag, and unnormalized Last-Modified metadata without reading an object
 body. Both operations support anonymous and presigned requests through the
 raw-network path, plus private requests through Sigil's opaque host-owned
-SigV4 signing grants.
+SigV4 signing grants. Listing never follows a continuation token itself: it
+returns one ordered page and lets the scenario choose whether to continue.
 
 The tagged authentication value makes conflicting modes unrepresentable. Lua
 variants use `{ tag = "...", value = ... }`:
@@ -44,6 +46,35 @@ returned exactly after HTTP optional whitespace is removed. Last-Modified is
 returned the same way and is deliberately not parsed, converted, or
 normalized.
 
+A caller-driven two-page listing uses the same tagged authentication shape:
+
+```lua
+local first, err = s3["list-objects"]({
+  bucket = "results",
+  prefix = "exports/",
+  ["max-keys"] = 100,
+  ["continuation-token"] = nil,
+  auth = { tag = "sigv4", value = "results-list" },
+})
+expect(first ~= nil, err and err.message)
+
+if first["is-truncated"] then
+  local second, second_err = s3["list-objects"]({
+    bucket = "results",
+    prefix = "exports/",
+    ["max-keys"] = 100,
+    ["continuation-token"] = first["next-continuation-token"],
+    auth = { tag = "sigv4", value = "results-list" },
+  })
+  expect(second ~= nil, second_err and second_err.message)
+end
+```
+
+Each object has a string `key`, typed unsigned `size`, exact optional `etag`,
+and unnormalized optional `last-modified`. `max-keys` is inclusive from 1
+through 1000. Prefixes are nonempty and at most 1024 UTF-8 bytes;
+caller-supplied continuation tokens are nonempty and at most 2048 UTF-8 bytes.
+
 The `object-store-read` string is an opaque signing-grant name. The component
 cannot supply or observe an endpoint, access key, secret key, session token,
 region, service, authority, or time for that mode. The operator grant owns all
@@ -69,6 +100,33 @@ methods = ["GET", "HEAD"]
 canonical_uri_prefixes = ["/results/"]
 query = {}
 header_names = []
+
+[plugins.grants.s3.sigv4.results-list]
+endpoint = "object-store"
+access_key_secret = "OBJECT_STORE_ACCESS_KEY"
+secret_key_secret = "OBJECT_STORE_SECRET_KEY"
+region = "us-east-1"
+service = "s3"
+authority = "minio:9000"
+methods = ["GET"]
+canonical_uri_prefixes = ["/results/"]
+header_names = []
+
+[plugins.grants.s3.sigv4.results-list.query.list-type]
+required = true
+exact_values = ["2"]
+
+[plugins.grants.s3.sigv4.results-list.query.max-keys]
+required = true
+decimal_max = 1000
+
+[plugins.grants.s3.sigv4.results-list.query.prefix]
+required = true
+encoded_prefixes = ["exports%2F"]
+
+[plugins.grants.s3.sigv4.results-list.query.continuation-token]
+required = false
+opaque_max_encoded_bytes = 6144
 ```
 
 Sigil resolves the named secrets from the scenario environment allowlist. No
@@ -114,10 +172,18 @@ local signing-lease expiry and all other host transport failures become
 sanitized `transport` errors. Raw upstream XML, request IDs, signature data,
 and host-internal details are never returned.
 
-The immutable 0.1.1 interface is retained byte-for-byte at
-`contracts/sigil-s3-client-0.1.1.wit` and verified by `just check`. The 0.2
-candidate exports `get-object` and `head-object`; bounded single-page object
-listing remains a separate future contract increment.
+LIST reads at most 4 MiB of XML plus 64 KiB of response framing, so its
+network grant must allow at least `4160KiB`. It rejects malformed UTF-8, DTDs,
+external or unknown entities, unknown elements, duplicate fields, invalid
+nesting, count disagreements, out-of-prefix or duplicate keys, and responses
+above the requested object count. No error returns a partial page. SigV4 LIST
+requires Host API 1.2; its grant fixes every query field and bounds the optional
+opaque token without exposing it in diagnostics.
+
+The immutable 0.1.1 and 0.2.0 interfaces are retained byte-for-byte at
+`contracts/sigil-s3-client-0.1.1.wit` and
+`contracts/sigil-s3-client-0.2.0.wit`, and both are verified by `just check`.
+The unpublished 0.3 candidate adds only `list-objects` and Host API 1.2.
 
 Build, validate against the pinned SDK host WITs, and pack a local development
 archive:

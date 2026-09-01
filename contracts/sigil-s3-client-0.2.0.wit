@@ -1,4 +1,4 @@
-package sigil:s3@0.3.0;
+package sigil:s3@0.2.0;
 
 interface client {
     enum error-class {
@@ -59,40 +59,6 @@ interface client {
         last-modified: option<string>,
     }
 
-    /// One explicitly bounded ListObjectsV2 page. The caller decides whether
-    /// to continue and supplies the returned token on a later call.
-    record list-options {
-        bucket: string,
-        prefix: string,
-        max-keys: u32,
-        continuation-token: option<string>,
-        auth: auth,
-    }
-
-    /// Object metadata in the exact order supplied by the service. Timestamp
-    /// and ETag text are returned without normalization.
-    record listed-object {
-        key: string,
-        size: u64,
-        etag: option<string>,
-        last-modified: option<string>,
-    }
-
-    /// A single page. Truncation is always explicit and a truncated page must
-    /// carry a nonempty next continuation token.
-    record list-page {
-        objects: list<listed-object>,
-        is-truncated: bool,
-        next-continuation-token: option<string>,
-    }
-
     get-object: func(options: object-options) -> result<list<u8>, error>;
     head-object: func(options: head-options) -> result<object-metadata, error>;
-    list-objects: func(options: list-options) -> result<list-page, error>;
-}
-
-world s3 {
-    import sigil:host/net@1.0.0;
-    import sigil:host/sigv4@1.2.0;
-    export client;
 }
