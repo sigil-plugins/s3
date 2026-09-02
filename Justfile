@@ -17,7 +17,10 @@ sdk-drift:
 release-workflow:
     {{python}} scripts/check-release-workflow.py
 
-check: sdk-drift release-workflow
+compatibility:
+    {{python}} scripts/check-compatibility.py
+
+check: sdk-drift release-workflow compatibility
     cargo fmt --all -- --check
     cargo test --locked
     cargo clippy --all-targets --locked -- -D warnings
