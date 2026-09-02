@@ -12,7 +12,9 @@ returns one ordered page and lets the scenario choose whether to continue.
 
 The public stable version remains 0.1.0, and 0.2.0-rc.1 is a public immutable
 prerelease with official package assets. The 0.3.0-rc.1 source candidate
-requires Sigil 0.33.1 and Host API 1.2, but it has no official package asset.
+requires Sigil 0.33.2-rc.1 or newer and Host API 1.2; stable Sigil 0.33.1
+predates manifest schema 3 and Host API 1.2 and cannot load it. The candidate
+has no official package asset.
 Do not use `sigil plugin install s3@0.3.0-rc.1` or add that identity to a
 project lock until a separately authorized release is published and verified.
 

@@ -9,7 +9,7 @@ file = "plugin.wasm"
 entrypoint = "sigil:s3/client@0.3.0"
 
 [requires]
-sigil = ">=0.33.1, <1.0.0"
+sigil = ">=0.33.2-rc.1, <1.0.0"
 host_api = "^1.2"
 
 [capabilities]
