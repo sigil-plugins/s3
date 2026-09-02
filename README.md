@@ -10,12 +10,13 @@ raw-network path, plus private requests through Sigil's opaque host-owned
 SigV4 signing grants. Listing never follows a continuation token itself: it
 returns one ordered page and lets the scenario choose whether to continue.
 
-The public immutable version remains 0.1.0. The candidate requires Sigil
-0.33.1 and Host API 1.2, but it has no official package asset. Do not use
-`sigil plugin install s3@0.3.0-rc.1` or add that identity to a project lock
-until a separately authorized release is published and verified.
+The public stable version remains 0.1.0, and 0.2.0-rc.1 is a public immutable
+prerelease with official package assets. The 0.3.0-rc.1 source candidate
+requires Sigil 0.33.1 and Host API 1.2, but it has no official package asset.
+Do not use `sigil plugin install s3@0.3.0-rc.1` or add that identity to a
+project lock until a separately authorized release is published and verified.
 
-| Public 0.1.0 | Unpublished 0.3.0-rc.1 source candidate |
+| Public stable 0.1.0 / prerelease 0.2.0-rc.1 | Unpublished 0.3.0-rc.1 source candidate |
 |---|---|
 | anonymous or presigned GET with an endpoint field | tagged anonymous, presigned, or opaque host-owned SigV4 auth |
 | GET only | GET, HEAD, and one bounded ListObjectsV2 page |
