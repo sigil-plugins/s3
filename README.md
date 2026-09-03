@@ -1,7 +1,7 @@
 # Sigil S3 plugin
 
 `wasm.s3` is a bounded, read-only S3-compatible object client for Sigil
-scenarios. The public 0.3.0-rc.1 prerelease performs one path-style
+scenarios. The accepted 0.3.0 stable source candidate performs one path-style
 HTTP `GET`, `HEAD`, or bounded ListObjectsV2 page. GET
 returns the exact object bytes as a binary Lua string; HEAD returns optional
 size, ETag, and unnormalized Last-Modified metadata without reading an object
@@ -10,13 +10,13 @@ raw-network path, plus private requests through Sigil's opaque host-owned
 SigV4 signing grants. Listing never follows a continuation token itself: it
 returns one ordered page and lets the scenario choose whether to continue.
 
-The public stable version remains 0.1.0; 0.2.0-rc.1 and 0.3.0-rc.1 are public
-immutable prereleases with official keyless-provenance assets. Version
-0.3.0-rc.1 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2. The stable Sigil 0.33.1
-release predates manifest schema 3 and Host API 1.2 and cannot load it. Add the exact
-compatible identities with `sigil plugin add s3@0.3.0-rc.1`.
+The public stable version remains 0.1.0 while 0.3.0 is prepared from the
+accepted immutable prerelease. Version 0.3.0 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2.
+The stable Sigil 0.33.1 release predates manifest schema 3 and Host API 1.2 and cannot load it.
+Do not add `s3@0.3.0` to a project lock until the separately authorized
+stable release is published and verified.
 
-| Public stable 0.1.0 | Public 0.3.0-rc.1 prerelease |
+| Public stable 0.1.0 | Accepted 0.3.0 stable source candidate |
 |---|---|
 | anonymous or presigned GET with an endpoint field | tagged anonymous, presigned, or opaque host-owned SigV4 auth |
 | GET only | GET, HEAD, and one bounded ListObjectsV2 page |
