@@ -1,6 +1,6 @@
 # Pinned S3 HEAD acceptance
 
-This gate proves the unpublished S3 0.3 component through Sigil's real plugin
+This gate proves the public S3 0.3 component through Sigil's real plugin
 store, lock, generated Lua types, component host, raw network route, and opaque
 SigV4 host signer. It publishes nothing.
 
@@ -28,12 +28,12 @@ just live-head
 The runner uses a tmpfs for MinIO data, gives the container a unique name,
 and verifies removal in its exit trap. Ignored evidence is retained under
 `target/live-head/run.*`, including the generated `wasm.s3` Lua stub, exact
-image and candidate identities, direct response headers, the JSON scenario
+image and release identities, direct response headers, the JSON scenario
 report, and teardown status.
 
 ## Pinned S3 LIST acceptance
 
-`just live-list` is the unpublished 0.3 listing gate. It uses the same pinned
+`just live-list` is the 0.3 listing gate. It uses the same pinned
 images and drives the exact local component through Sigil's store, lock,
 generated Lua types, raw network route, and Host API 1.2 signer. Independent
 HTTP listings establish the expected server order, unsigned sizes, ETags, and
