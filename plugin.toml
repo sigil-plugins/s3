@@ -1,6 +1,6 @@
 schema_version = 3
 name = "s3"
-version = "0.3.0-rc.1"
+version = "0.3.0"
 description = "bounded read-only S3-compatible object, metadata, and single-page prefix reader for Sigil"
 license = "MIT"
 

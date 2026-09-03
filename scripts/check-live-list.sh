@@ -76,7 +76,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-archive="$ROOT/dist/s3-0.3.0-rc.1.sigil-plugin.tar.zst"
+archive="$ROOT/dist/s3-0.3.0.sigil-plugin.tar.zst"
 if [[ ! -f "$archive" ]]; then
   echo "missing candidate archive: $archive" >&2
   exit 2
@@ -253,8 +253,8 @@ cargo generate-lockfile --quiet --offline --manifest-path "$SCRATCH/seeder/Cargo
 CARGO_TARGET_DIR="$ROOT/target/sigil-compat-seed" \
   cargo run --quiet --locked --offline --manifest-path "$SCRATCH/seeder/Cargo.toml" -- \
   "$SCRATCH/data" \
-  "$SCRATCH/package/dist/s3-0.3.0-rc.1.sigil-plugin.tar.zst" \
-  github:conformance/s3 s3 0.3.0-rc.1 s3-list-live-0.3.0-rc.1
+  "$SCRATCH/package/dist/s3-0.3.0.sigil-plugin.tar.zst" \
+  github:conformance/s3 s3 0.3.0 s3-list-live-0.3.0
 
 python3 - "$ROOT/conformance/sigil-list.toml.in" \
   "$SCRATCH/project/.sigil/sigil.toml" "$authority" <<'PY'
