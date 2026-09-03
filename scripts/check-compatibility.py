@@ -14,10 +14,18 @@ REQUIRED_README_CLAIMS = (
     "cannot load it",
     "sigil plugin add s3@0.3.0",
 )
-FORBIDDEN_README_CLAIMS = (
-    "Version 0.3.0 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2.",
+FORBIDDEN_README_FRAGMENTS = (
+    "version 0.3.0 requires sigil 0.33.2-rc.1 or newer and host api 1.2",
     "0.3.0 candidate",
-    "schema-3 S3 candidate",
+    "schema-3 s3 candidate",
+    "accepted 0.3.0 stable source candidate",
+    "public stable version remains 0.1.0",
+    "public stable 0.1.0 remains current",
+    "accepted immutable prerelease",
+    "do not add `s3@0.3.0`",
+    "do not add s3@0.3.0",
+    "until the separately authorized stable release",
+    "the 0.3 prerelease adds only",
 )
 
 
@@ -26,9 +34,12 @@ def check_readme(readme: str) -> None:
     for claim in REQUIRED_README_CLAIMS:
         if claim not in readme:
             raise ValueError(f"README is missing compatibility claim: {claim!r}")
-    for claim in FORBIDDEN_README_CLAIMS:
-        if claim in readme:
-            raise ValueError(f"README retains stale compatibility claim: {claim!r}")
+    normalized = readme.casefold()
+    for fragment in FORBIDDEN_README_FRAGMENTS:
+        if fragment in normalized:
+            raise ValueError(
+                f"README retains stale compatibility claim: {fragment!r}"
+            )
 
 
 def main() -> None:

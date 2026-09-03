@@ -30,9 +30,24 @@ class ReadmeCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stale compatibility claim"):
             CHECK.check_readme(contradictory)
 
-    def test_obsolete_candidate_wording_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "stale compatibility claim"):
-            CHECK.check_readme(self.readme + "\nThe 0.3.0 candidate is current.\n")
+    def test_retired_source_candidate_guidance_is_rejected(self) -> None:
+        stale_guidance = (
+            "The accepted 0.3.0 stable source candidate is ready.",
+            (
+                "Public stable 0.1.0 remains current while 0.3.0 is prepared "
+                "from the accepted immutable prerelease."
+            ),
+            (
+                "Do not add s3@0.3.0 until the separately authorized stable "
+                "release is published and verified."
+            ),
+            "| Public stable 0.1.0 | Accepted 0.3.0 stable source candidate |",
+            "The 0.3 prerelease adds only list-objects and Host API 1.2.",
+        )
+        for guidance in stale_guidance:
+            with self.subTest(guidance=guidance):
+                with self.assertRaisesRegex(ValueError, "stale compatibility claim"):
+                    CHECK.check_readme(f"{self.readme}\n{guidance}\n")
 
 
 if __name__ == "__main__":
