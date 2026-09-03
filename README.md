@@ -1,7 +1,7 @@
 # Sigil S3 plugin
 
 `wasm.s3` is a bounded, read-only S3-compatible object client for Sigil
-scenarios. The accepted 0.3.0 stable source candidate performs one path-style
+scenarios. The public 0.3.0 stable release performs one path-style
 HTTP `GET`, `HEAD`, or bounded ListObjectsV2 page. GET
 returns the exact object bytes as a binary Lua string; HEAD returns optional
 size, ETag, and unnormalized Last-Modified metadata without reading an object
@@ -10,13 +10,11 @@ raw-network path, plus private requests through Sigil's opaque host-owned
 SigV4 signing grants. Listing never follows a continuation token itself: it
 returns one ordered page and lets the scenario choose whether to continue.
 
-The public stable version remains 0.1.0 while 0.3.0 is prepared from the
-accepted immutable prerelease. Version 0.3.0 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2.
+Version 0.3.0 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2.
 The stable Sigil 0.33.1 release predates manifest schema 3 and Host API 1.2 and cannot load it.
-Do not add `s3@0.3.0` to a project lock until the separately authorized
-stable release is published and verified.
+Add the exact immutable identity with `sigil plugin add s3@0.3.0`.
 
-| Public stable 0.1.0 | Accepted 0.3.0 stable source candidate |
+| Public stable 0.1.0 | Public stable 0.3.0 |
 |---|---|
 | anonymous or presigned GET with an endpoint field | tagged anonymous, presigned, or opaque host-owned SigV4 auth |
 | GET only | GET, HEAD, and one bounded ListObjectsV2 page |
@@ -196,7 +194,7 @@ opaque token without exposing it in diagnostics.
 The immutable 0.1.1 and 0.2.0 interfaces are retained byte-for-byte at
 `contracts/sigil-s3-client-0.1.1.wit` and
 `contracts/sigil-s3-client-0.2.0.wit`, and both are verified by `just check`.
-The 0.3 prerelease adds only `list-objects` and Host API 1.2.
+The 0.3 interface adds only `list-objects` and Host API 1.2.
 
 Build, validate against the pinned SDK host WITs, and pack a local development
 archive:
