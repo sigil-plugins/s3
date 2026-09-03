@@ -19,6 +19,7 @@ release-workflow:
 
 compatibility:
     {{python}} scripts/check-compatibility.py
+    {{python}} -m unittest discover -s scripts -p 'test_compatibility.py'
 
 check: sdk-drift release-workflow compatibility
     cargo fmt --all -- --check

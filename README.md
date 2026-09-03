@@ -10,8 +10,9 @@ raw-network path, plus private requests through Sigil's opaque host-owned
 SigV4 signing grants. Listing never follows a continuation token itself: it
 returns one ordered page and lets the scenario choose whether to continue.
 
-Version 0.3.0 requires Sigil 0.33.2-rc.1 or newer and Host API 1.2.
-The stable Sigil 0.33.1 release predates manifest schema 3 and Host API 1.2 and cannot load it.
+Version 0.3.0 requires stable Sigil 0.33.2 or newer and Host API 1.2.
+The required host support first appeared in the 0.33.2-rc.1 prerelease; stable
+Sigil 0.33.1 predates manifest schema 3 and Host API 1.2 and cannot load it.
 Add the exact immutable identity with `sigil plugin add s3@0.3.0`.
 
 | Public stable 0.1.0 | Public stable 0.3.0 |

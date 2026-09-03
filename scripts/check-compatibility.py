@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the schema-3 S3 candidate's Sigil compatibility floor truthful."""
+"""Keep the stable schema-3 S3 compatibility documentation truthful."""
 
 from pathlib import Path
 import tomllib
@@ -7,6 +7,39 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_SIGIL = ">=0.33.2-rc.1, <1.0.0"
+REQUIRED_README_CLAIMS = (
+    "requires stable Sigil 0.33.2 or newer and Host API 1.2",
+    "first appeared in the 0.33.2-rc.1 prerelease",
+    "Sigil 0.33.1 predates manifest schema 3",
+    "cannot load it",
+    "sigil plugin add s3@0.3.0",
+)
+FORBIDDEN_README_FRAGMENTS = (
+    "version 0.3.0 requires sigil 0.33.2-rc.1 or newer and host api 1.2",
+    "0.3.0 candidate",
+    "schema-3 s3 candidate",
+    "accepted 0.3.0 stable source candidate",
+    "public stable version remains 0.1.0",
+    "public stable 0.1.0 remains current",
+    "accepted immutable prerelease",
+    "do not add `s3@0.3.0`",
+    "do not add s3@0.3.0",
+    "until the separately authorized stable release",
+    "the 0.3 prerelease adds only",
+)
+
+
+def check_readme(readme: str) -> None:
+    """Reject missing stable claims and contradictory prerelease guidance."""
+    for claim in REQUIRED_README_CLAIMS:
+        if claim not in readme:
+            raise ValueError(f"README is missing compatibility claim: {claim!r}")
+    normalized = readme.casefold()
+    for fragment in FORBIDDEN_README_FRAGMENTS:
+        if fragment in normalized:
+            raise ValueError(
+                f"README retains stale compatibility claim: {fragment!r}"
+            )
 
 
 def main() -> None:
@@ -14,11 +47,13 @@ def main() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     expected = {
+        "version": "0.3.0",
         "schema_version": 3,
         "host_api": "^1.2",
         "sigil": EXPECTED_SIGIL,
     }
     observed = {
+        "version": manifest["version"],
         "schema_version": manifest["schema_version"],
         "host_api": manifest["requires"]["host_api"],
         "sigil": manifest["requires"]["sigil"],
@@ -26,13 +61,10 @@ def main() -> None:
     if observed != expected:
         raise SystemExit(f"incompatible schema-3 contract: {observed!r} != {expected!r}")
 
-    for claim in (
-        "requires Sigil 0.33.2-rc.1 or newer and Host API 1.2",
-        "stable Sigil 0.33.1",
-        "cannot load it",
-    ):
-        if claim not in readme:
-            raise SystemExit(f"README is missing compatibility claim: {claim!r}")
+    try:
+        check_readme(readme)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":
